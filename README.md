@@ -51,9 +51,12 @@ Point your VLESS/VMess client at `127.0.0.1:<listen_port>` instead of the real s
 
 ### Logging
 
-Set `RUST_LOG` for verbosity:
+The default log level is `warn` -- the tool runs silent unless something goes wrong. No connection metadata is logged by default.
+
+Set `RUST_LOG` for verbosity when debugging:
 
 ```
+sudo RUST_LOG=info ./sni-spoof-rs config.json
 sudo RUST_LOG=debug ./sni-spoof-rs config.json
 ```
 
