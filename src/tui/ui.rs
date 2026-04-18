@@ -22,7 +22,7 @@ const COLOR_BG: Color = Color::Black;
 const COLOR_BORDER: Color = Color::Blue;
 
 pub fn render(f: &mut Frame, state: &AppState) {
-    let size = f.area();
+    let size = f.size();
 
     f.render_widget(
         Block::default().style(Style::default().bg(COLOR_BG)),
