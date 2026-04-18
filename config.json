@@ -9,7 +9,7 @@
     "timeout_secs": 30,
     "buffer_size": 8192,
     "max_connections": 100,
-    "fragment_enabled": false,
+    "fragment_enabled": true,
     "frag_split": 1,
     "frag_delay_ms": 1
   },

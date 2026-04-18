@@ -306,7 +306,7 @@ impacts SNI filtering.
 
 Defaults:
 
-- `fragment_enabled = false`
+- `fragment_enabled = true`
 - `frag_split = 1`
 - `frag_delay_ms = 1`
 

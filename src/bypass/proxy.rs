@@ -203,29 +203,13 @@ async fn handle_tls_tunnel(
 
     if fragment_enabled {
         let mut first = vec![0u8; 16 * 1024];
-        let n = timeout(Duration::from_secs(10), client.read(&mut first))
-            .await??;
+        let n = client.read(&mut first).await?;
         if n == 0 {
             return Ok(0);
-        }
-        if n < 2 {
-            upstream.write_all(&first[..n]).await?;
-            let mut bytes = n as u64;
-            let (from_client, from_server) =
-                tokio::io::copy_bidirectional(&mut client, &mut upstream)
-                    .await?;
-            bytes += from_client + from_server;
-            return Ok(bytes);
         }
 
         let split_at =
             frag_split.clamp(1, n.saturating_sub(1).max(1));
-        tracing::debug!(
-            split_at,
-            frag_delay_ms,
-            first_payload = n,
-            "fragmenting first CONNECT payload"
-        );
         upstream.write_all(&first[..split_at]).await?;
         tokio::time::sleep(Duration::from_millis(frag_delay_ms)).await;
         upstream.write_all(&first[split_at..n]).await?;

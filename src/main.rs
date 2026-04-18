@@ -40,7 +40,7 @@ pub struct ProxyConfig {
     pub frag_delay_ms: u64,
 }
 
-fn default_fragment_enabled() -> bool { false }
+fn default_fragment_enabled() -> bool { true }
 fn default_frag_split() -> usize { 1 }
 fn default_frag_delay_ms() -> u64 { 1 }
 
@@ -219,11 +219,11 @@ struct Args {
     print_config: bool,
 
     /// Force-enable CONNECT first-payload fragmentation mode
-    #[arg(long, conflicts_with = "no_fragment")]
+    #[arg(long)]
     fragment: bool,
 
     /// Force-disable CONNECT first-payload fragmentation mode
-    #[arg(long, conflicts_with = "fragment")]
+    #[arg(long)]
     no_fragment: bool,
 
     /// Split point for first fragmented payload (bytes)
