@@ -1,0 +1,36 @@
+# SNI Hosts file for scanner
+# One host per line, # for comments
+
+cloudflare.com
+cdn.cloudflare.net
+1.1.1.1
+workers.dev
+pages.dev
+r2.dev
+
+# Major CDNs
+fastly.net
+cdn.fastly.net
+global.fastly.net
+edgecastcdn.net
+
+# Akamai
+akamaiedge.net
+akadns.net
+akamaized.net
+
+# Google
+googleapis.com
+gstatic.com
+googleusercontent.com
+googlevideo.com
+ytimg.com
+
+# AWS CloudFront
+cloudfront.net
+amazonaws.com
+
+# Specific common SNIs
+storage.googleapis.com
+ajax.googleapis.com
+fonts.googleapis.com
