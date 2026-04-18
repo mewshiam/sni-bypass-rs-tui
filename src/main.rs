@@ -314,7 +314,7 @@ fn setup_logger(log_file: &str, level: &str) {
 
 /// Full TUI mode
 async fn run_tui(config: Config, is_termux: bool) -> Result<()> {
-    let mut app = App::new(&config, is_termux)?;
+    let mut app = App::new(config.port, is_termux)?;
 
     // Pre-fill from config
     if !config.proxy.target_host.is_empty() {
@@ -411,21 +411,7 @@ async fn run_scan_only(config: &Config) -> Result<()> {
         .with_timeout(config.scanner.timeout_secs);
 
     // Live progress callback
-    let results = scanner
-        .scan_from_file_with_progress(hosts_file, |result| {
-            if result.is_working {
-                println!(
-                    "  [✓] {:<40} {}ms  TLS:{} HTTP:{}",
-                    result.host,
-                    result.latency_ms,
-                    if result.tls_ok { "✓" } else { "✗" },
-                    if result.http_ok { "✓" } else { "✗" },
-                );
-            } else {
-                println!("  [✗] {:<40} timeout", result.host);
-            }
-        })
-        .await?;
+     let results = scanner.scan_from_file(&hosts_file).await?;
 
     // Summary
     let working: Vec<_> = results.iter().filter(|r| r.is_working).collect();
