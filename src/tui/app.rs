@@ -1,8 +1,8 @@
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode,
-        KeyEvent, KeyModifiers,
+        self, DisableMouseCapture, EnableMouseCapture, Event,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     },
     execute,
     terminal::{
@@ -555,89 +555,104 @@ impl App {
     // ── Run ───────────────────────────────────
 
     pub async fn run(mut self) -> Result<()> {
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend)?;
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
 
-        {
-            let mut s = self.state.lock().unwrap();
-            let termux = s.is_termux;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        // Tells terminal to send key press/release separately
+        // so we can filter to press-only — prevents double input
+        crossterm::event::EnableBracketedPaste,
+    )?;
+
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    {
+        let mut s = self.state.lock().unwrap();
+        let termux = s.is_termux;
+        s.add_log(
+            LogLevel::Info,
+            format!(
+                "SNI Bypass RS-TUI v{} started",
+                env!("CARGO_PKG_VERSION")
+            ),
+        );
+        if termux {
             s.add_log(
                 LogLevel::Info,
-                format!(
-                    "SNI Bypass RS-TUI v{} started",
-                    env!("CARGO_PKG_VERSION")
-                ),
+                "Termux detected — clipboard via termux-clipboard-get/set",
             );
-            if termux {
-                s.add_log(
-                    LogLevel::Info,
-                    "Termux detected — clipboard via termux-clipboard-get/set",
-                );
-            }
-            s.add_log(LogLevel::Info, "Press [?] for help");
         }
-
-        let _eh = EventHandler::new(self.event_tx.clone());
-        let result = self.main_loop(&mut terminal).await;
-
-        disable_raw_mode()?;
-        execute!(
-            terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        )?;
-        terminal.show_cursor()?;
-
-        if let Some(h) = self.proxy_handle {
-            h.abort();
-        }
-        if let Some(h) = self.scanner_handle {
-            h.abort();
-        }
-
-        result
+        s.add_log(LogLevel::Info, "Press [?] for help");
     }
+
+    let _eh = EventHandler::new(self.event_tx.clone());
+    let result = self.main_loop(&mut terminal).await;
+
+    // Restore terminal — must disable what we enabled
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste,
+    )?;
+    terminal.show_cursor()?;
+
+    if let Some(h) = self.proxy_handle {
+        h.abort();
+    }
+    if let Some(h) = self.scanner_handle {
+        h.abort();
+    }
+
+    result
+}
 
     // ── Main loop ─────────────────────────────
 
-    async fn main_loop<B: ratatui::backend::Backend>(
-        &mut self,
-        terminal: &mut Terminal<B>,
-    ) -> Result<()> {
-        let tick = Duration::from_millis(16);
+    sync fn main_loop<B: ratatui::backend::Backend>(
+    &mut self,
+    terminal: &mut Terminal<B>,
+) -> Result<()> {
+    let tick = Duration::from_millis(16);
 
-        loop {
-            // Draw frame
-            {
-                let s = self.state.lock().unwrap();
-                terminal.draw(|f| ui::render(f, &s))?;
-            }
+    loop {
+        // Draw frame
+        {
+            let s = self.state.lock().unwrap();
+            terminal.draw(|f| ui::render(f, &s))?;
+        }
 
-            // Poll input
-            if event::poll(tick)? {
-                match event::read()? {
-                    Event::Key(key) => {
-                        if !self.handle_key(key).await? {
-                            return Ok(());
-                        }
+        // Poll input
+        if event::poll(tick)? {
+            match event::read()? {
+                Event::Key(key)
+                    // Only handle Press — ignore Release and Repeat
+                    // to prevent double input on crossterm 0.27+
+                    if key.kind == KeyEventKind::Press =>
+                {
+                    if !self.handle_key(key).await? {
+                        return Ok(());
                     }
-                    Event::Paste(text) => {
-                        self.handle_paste(text);
-                    }
-                    Event::Resize(_, _) => {}
-                    _ => {}
                 }
-            }
-
-            // Drain internal events
-            while let Ok(ev) = self.event_rx.try_recv() {
-                self.handle_app_event(ev).await?;
+                Event::Paste(text) => {
+                    self.handle_paste(text);
+                }
+                Event::Resize(_, _) => {}
+                _ => {}
             }
         }
+
+        // Drain internal events
+        while let Ok(ev) = self.event_rx.try_recv() {
+            self.handle_app_event(ev).await?;
+        }
     }
+}
 
     // ── Paste ─────────────────────────────────
 
