@@ -115,9 +115,7 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn load() -> Self {
-        let path = "config.json";
-
+    pub fn load_from(path: &str) -> Self {
         if Path::new(path).exists() {
             match std::fs::read_to_string(path) {
                 Ok(content) => {
@@ -158,11 +156,11 @@ impl Config {
         default
     }
 
-    pub fn save(&self) {
+    pub fn save_to(&self, path: &str) {
         match serde_json::to_string_pretty(self) {
             Ok(json) => {
-                if let Err(e) = std::fs::write("config.json", json) {
-                    eprintln!("[!] Could not save config.json: {}", e);
+                if let Err(e) = std::fs::write(path, json) {
+                    eprintln!("[!] Could not save {}: {}", path, e);
                 }
             }
             Err(e) => {
@@ -219,6 +217,22 @@ struct Args {
     /// Print current config and exit
     #[arg(long)]
     print_config: bool,
+
+    /// Force-enable CONNECT first-payload fragmentation mode
+    #[arg(long)]
+    fragment: bool,
+
+    /// Force-disable CONNECT first-payload fragmentation mode
+    #[arg(long)]
+    no_fragment: bool,
+
+    /// Split point for first fragmented payload (bytes)
+    #[arg(long)]
+    frag_split: Option<usize>,
+
+    /// Delay between first/second fragments (milliseconds)
+    #[arg(long)]
+    frag_delay_ms: Option<u64>,
 }
 
 // ─────────────────────────────────────────────
@@ -230,7 +244,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     // Load config
-    let mut config = Config::load();
+    let mut config = Config::load_from(&args.config);
 
     // Print config and exit if requested
     if args.print_config {
@@ -240,6 +254,7 @@ async fn main() -> Result<()> {
 
     // CLI args override config values
     apply_args_to_config(&args, &mut config);
+    normalize_proxy_config(&mut config.proxy);
 
     // Setup file logger (keep terminal clean for TUI)
     setup_logger(&config.log.file, &config.log.level);
@@ -288,10 +303,36 @@ fn apply_args_to_config(args: &Args, config: &mut Config) {
     if let Some(concurrency) = args.concurrency {
         config.scanner.concurrency = concurrency;
     }
+    if args.fragment {
+        config.proxy.fragment_enabled = true;
+    }
+    if args.no_fragment {
+        config.proxy.fragment_enabled = false;
+    }
+    if let Some(frag_split) = args.frag_split {
+        config.proxy.frag_split = frag_split;
+    }
+    if let Some(frag_delay_ms) = args.frag_delay_ms {
+        config.proxy.frag_delay_ms = frag_delay_ms;
+    }
 
     // If sni not set, default to target
     if config.proxy.sni_host.is_empty() && !config.proxy.target_host.is_empty() {
         config.proxy.sni_host = config.proxy.target_host.clone();
+    }
+}
+
+fn normalize_proxy_config(proxy: &mut ProxyConfig) {
+    if proxy.frag_split == 0 {
+        eprintln!("[!] frag_split=0 is invalid, using 1");
+        proxy.frag_split = 1;
+    }
+    if proxy.frag_delay_ms > 10_000 {
+        eprintln!(
+            "[!] frag_delay_ms={} is too high, clamping to 10000",
+            proxy.frag_delay_ms
+        );
+        proxy.frag_delay_ms = 10_000;
     }
 }
 
@@ -375,6 +416,12 @@ async fn run_headless(config: &Config) -> Result<()> {
     println!("[*] Target  : {}", target);
     println!("[*] SNI     : {}", sni);
     println!("[*] Port    : {}", port);
+    println!(
+        "[*] Frag    : {} (split={}, delay={}ms)",
+        config.proxy.fragment_enabled,
+        config.proxy.frag_split,
+        config.proxy.frag_delay_ms
+    );
     println!("[*] Log     : {}", config.log.file);
     println!();
     println!("[*] Starting proxy... (Ctrl+C to stop)");
