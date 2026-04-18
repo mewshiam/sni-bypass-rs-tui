@@ -32,7 +32,7 @@ const COLOR_BORDER: Color = Color::Blue;
 // ─────────────────────────────────────────────
 
 pub fn render(f: &mut Frame, state: &AppState) {
-    let size = f.area();
+    let size = f.size();
 
     // Background fill
     f.render_widget(
