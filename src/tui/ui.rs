@@ -1,1138 +1,1493 @@
-use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{
-        Block, BorderType, Borders, Cell, Clear, Gauge, List, ListItem,
-        Padding, Paragraph, Row, Table, Tabs, Wrap,
+use anyhow::Result;
+use crossterm::{
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode,
+        KeyEvent, KeyModifiers,
     },
-    Frame,
+    execute,
+    terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
+use ratatui::{backend::CrosstermBackend, Terminal};
+use std::{
+    io,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::sync::mpsc;
 
-use super::app::{AppState, AppTab, InputMode, LogLevel, ProxyStatus, ScanStatus};
+use super::events::{AppEvent, EventHandler};
+use super::ui;
+use crate::bypass::ProxyServer;
+use crate::scanner::{ScanResult, SniScanner};
+use crate::Config;
 
-// Color Palette
-const COLOR_PRIMARY: Color = Color::Cyan;
-const COLOR_SUCCESS: Color = Color::Green;
-const COLOR_WARNING: Color = Color::Yellow;
-const COLOR_ERROR: Color = Color::Red;
-const COLOR_DIM: Color = Color::DarkGray;
-const COLOR_HIGHLIGHT: Color = Color::LightCyan;
-const COLOR_BG: Color = Color::Black;
-const COLOR_BORDER: Color = Color::Blue;
+// ─────────────────────────────────────────────
+// Types
+// ─────────────────────────────────────────────
 
-pub fn render(f: &mut Frame, state: &AppState) {
-    let size = f.size();
+#[derive(Debug, Clone, PartialEq)]
+pub enum AppTab {
+    Dashboard,
+    Scanner,
+    Results,
+    Logs,
+    Help,
+}
 
-    f.render_widget(
-        Block::default().style(Style::default().bg(COLOR_BG)),
-        size,
-    );
+#[derive(Debug, Clone, PartialEq)]
+pub enum InputMode {
+    Normal,
+    Editing,
+}
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(2),
-        ])
-        .split(size);
+#[derive(Debug, Clone)]
+pub struct LogEntry {
+    pub timestamp: String,
+    pub level: LogLevel,
+    pub message: String,
+}
 
-    render_header(f, state, chunks[0]);
-    render_content(f, state, chunks[1]);
-    render_statusbar(f, state, chunks[2]);
+#[derive(Debug, Clone, PartialEq)]
+pub enum LogLevel {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
 
-    if state.show_help_popup {
-        render_help_popup(f, size);
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProxyStatus {
+    Stopped,
+    Starting,
+    Running,
+    Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScanStatus {
+    Idle,
+    Running,
+    Completed,
+    Error(String),
+}
+
+// ─────────────────────────────────────────────
+// Input field — tracks value + cursor position
+// ─────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default)]
+pub struct InputField {
+    pub value: String,
+    pub cursor: usize, // byte index
+}
+
+impl InputField {
+    pub fn new(value: impl Into<String>) -> Self {
+        let value = value.into();
+        let cursor = value.len();
+        Self { value, cursor }
+    }
+
+    pub fn insert(&mut self, c: char) {
+        // Clamp cursor to valid char boundary
+        let cursor = self.clamp_cursor(self.cursor);
+        self.value.insert(cursor, c);
+        self.cursor = cursor + c.len_utf8();
+    }
+
+    pub fn delete_backward(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        // Find previous char boundary
+        let cursor = self.clamp_cursor(self.cursor);
+        let prev = self.prev_char_boundary(cursor);
+        self.value.drain(prev..cursor);
+        self.cursor = prev;
+    }
+
+    pub fn delete_forward(&mut self) {
+        let cursor = self.clamp_cursor(self.cursor);
+        if cursor >= self.value.len() {
+            return;
+        }
+        let next = self.next_char_boundary(cursor);
+        self.value.drain(cursor..next);
+        // cursor stays
+    }
+
+    pub fn move_left(&mut self) {
+        let cursor = self.clamp_cursor(self.cursor);
+        self.cursor = self.prev_char_boundary(cursor);
+    }
+
+    pub fn move_right(&mut self) {
+        let cursor = self.clamp_cursor(self.cursor);
+        self.cursor = self.next_char_boundary(cursor);
+    }
+
+    pub fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn move_end(&mut self) {
+        self.cursor = self.value.len();
+    }
+
+    /// Delete from cursor to start of line (Ctrl+U)
+    pub fn delete_to_start(&mut self) {
+        let cursor = self.clamp_cursor(self.cursor);
+        self.value.drain(..cursor);
+        self.cursor = 0;
+    }
+
+    /// Delete from cursor to end of line (Ctrl+K)
+    pub fn delete_to_end(&mut self) {
+        let cursor = self.clamp_cursor(self.cursor);
+        self.value.truncate(cursor);
+    }
+
+    /// Delete previous word (Ctrl+W)
+    pub fn delete_word_backward(&mut self) {
+        let cursor = self.clamp_cursor(self.cursor);
+        if cursor == 0 {
+            return;
+        }
+        // Skip trailing spaces
+        let mut pos = cursor;
+        while pos > 0 {
+            let prev = self.prev_char_boundary(pos);
+            if self.value[prev..pos].chars().next() == Some(' ') {
+                pos = prev;
+            } else {
+                break;
+            }
+        }
+        // Delete until space or start
+        while pos > 0 {
+            let prev = self.prev_char_boundary(pos);
+            if self.value[prev..pos].chars().next() == Some(' ') {
+                break;
+            }
+            pos = prev;
+        }
+        self.value.drain(pos..cursor);
+        self.cursor = pos;
+    }
+
+    pub fn paste(&mut self, text: &str) {
+        // Strip control chars / newlines for single-line fields
+        let clean: String = text
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        let cursor = self.clamp_cursor(self.cursor);
+        self.value.insert_str(cursor, &clean);
+        self.cursor = cursor + clean.len();
+    }
+
+    pub fn set(&mut self, value: impl Into<String>) {
+        self.value = value.into();
+        self.cursor = self.value.len();
+    }
+
+    pub fn clear(&mut self) {
+        self.value.clear();
+        self.cursor = 0;
+    }
+
+    /// Returns display string with cursor character injected
+    pub fn display_with_cursor(&self) -> String {
+        let cursor = self.clamp_cursor(self.cursor);
+        if cursor >= self.value.len() {
+            format!("{}█", self.value)
+        } else {
+            let (before, after) = self.value.split_at(cursor);
+            let mut chars = after.chars();
+            let cur_char = chars.next().unwrap_or(' ');
+            format!(
+                "{}[{}]{}",
+                before,
+                cur_char,
+                chars.as_str()
+            )
+        }
+    }
+
+    /// Returns the visible cursor column (char count, not byte)
+    pub fn cursor_col(&self) -> usize {
+        let cursor = self.clamp_cursor(self.cursor);
+        self.value[..cursor].chars().count()
+    }
+
+    fn clamp_cursor(&self, pos: usize) -> usize {
+        pos.min(self.value.len())
+    }
+
+    fn prev_char_boundary(&self, pos: usize) -> usize {
+        if pos == 0 {
+            return 0;
+        }
+        let mut p = pos - 1;
+        while p > 0 && !self.value.is_char_boundary(p) {
+            p -= 1;
+        }
+        p
+    }
+
+    fn next_char_boundary(&self, pos: usize) -> usize {
+        if pos >= self.value.len() {
+            return self.value.len();
+        }
+        let mut p = pos + 1;
+        while p < self.value.len() && !self.value.is_char_boundary(p) {
+            p += 1;
+        }
+        p
     }
 }
 
-fn render_header(f: &mut Frame, state: &AppState, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(area);
+// ─────────────────────────────────────────────
+// Which field is active per tab
+// ─────────────────────────────────────────────
 
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(" ◈ ", Style::default().fg(COLOR_PRIMARY)),
-        Span::styled(
-            "SNI BYPASS",
-            Style::default()
-                .fg(COLOR_PRIMARY)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" RS-TUI", Style::default().fg(COLOR_DIM)),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(COLOR_BORDER))
-            .padding(Padding::horizontal(1)),
-    );
-    f.render_widget(title, chunks[0]);
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActiveField {
+    // Dashboard fields
+    Target,
+    Sni,
+    Port,
+    // Scanner fields
+    HostsFile,
+    Concurrency,
+}
 
-    let tab_titles = vec![
-        " 1:Dashboard ",
-        " 2:Scanner ",
-        " 3:Results ",
-        " 4:Logs ",
-        " 5:Help ",
-    ];
-    let active_idx = match state.active_tab {
-        AppTab::Dashboard => 0,
-        AppTab::Scanner => 1,
-        AppTab::Results => 2,
-        AppTab::Logs => 3,
-        AppTab::Help => 4,
-    };
+impl ActiveField {
+    pub fn dashboard_fields() -> Vec<ActiveField> {
+        vec![
+            ActiveField::Target,
+            ActiveField::Sni,
+            ActiveField::Port,
+        ]
+    }
 
-    let tabs = Tabs::new(
-        tab_titles
+    pub fn scanner_fields() -> Vec<ActiveField> {
+        vec![ActiveField::HostsFile, ActiveField::Concurrency]
+    }
+
+    pub fn next_in_tab(&self, tab: &AppTab) -> ActiveField {
+        let fields = Self::fields_for_tab(tab);
+        let pos = fields.iter().position(|f| f == self).unwrap_or(0);
+        fields[(pos + 1) % fields.len()].clone()
+    }
+
+    pub fn prev_in_tab(&self, tab: &AppTab) -> ActiveField {
+        let fields = Self::fields_for_tab(tab);
+        let pos = fields.iter().position(|f| f == self).unwrap_or(0);
+        let len = fields.len();
+        fields[(pos + len - 1) % len].clone()
+    }
+
+    pub fn fields_for_tab(tab: &AppTab) -> Vec<ActiveField> {
+        match tab {
+            AppTab::Dashboard => Self::dashboard_fields(),
+            AppTab::Scanner => Self::scanner_fields(),
+            _ => vec![],
+        }
+    }
+
+    pub fn index(&self, tab: &AppTab) -> usize {
+        Self::fields_for_tab(tab)
             .iter()
-            .map(|t| Line::from(Span::raw(*t)))
-            .collect::<Vec<_>>(),
-    )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(COLOR_BORDER)),
-    )
-    .select(active_idx)
-    .style(Style::default().fg(COLOR_DIM))
-    .highlight_style(
-        Style::default()
-            .fg(COLOR_PRIMARY)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-    );
-
-    f.render_widget(tabs, chunks[1]);
-}
-
-fn render_content(f: &mut Frame, state: &AppState, area: Rect) {
-    match state.active_tab {
-        AppTab::Dashboard => render_dashboard(f, state, area),
-        AppTab::Scanner => render_scanner(f, state, area),
-        AppTab::Results => render_results(f, state, area),
-        AppTab::Logs => render_logs(f, state, area),
-        AppTab::Help => render_help(f, area),
+            .position(|f| f == self)
+            .unwrap_or(0)
     }
 }
 
-fn render_dashboard(f: &mut Frame, state: &AppState, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
+// ─────────────────────────────────────────────
+// AppState
+// ─────────────────────────────────────────────
 
-    let left_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(0)])
-        .split(chunks[0]);
+pub struct AppState {
+    // Navigation
+    pub active_tab: AppTab,
+    pub input_mode: InputMode,
+    pub active_field: ActiveField,
 
-    render_proxy_config(f, state, left_chunks[0]);
-    render_stats(f, state, left_chunks[1]);
+    // Proxy config inputs
+    pub field_target: InputField,
+    pub field_sni: InputField,
+    pub field_port: InputField,
 
-    let right_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(7), Constraint::Min(0)])
-        .split(chunks[1]);
+    // Scanner inputs
+    pub field_hosts_file: InputField,
+    pub field_concurrency: InputField,
 
-    render_proxy_status(f, state, right_chunks[0]);
-    render_quick_actions(f, state, right_chunks[1]);
+    // Proxy runtime state
+    pub target_host: String,
+    pub sni_host: String,
+    pub proxy_port: u16,
+    pub proxy_status: ProxyStatus,
+
+    // Scanner runtime state
+    pub scan_status: ScanStatus,
+    pub scan_results: Vec<ScanResult>,
+    pub scan_progress: f64,
+    pub scan_total: usize,
+    pub scan_done: usize,
+
+    // Results navigation
+    pub selected_result: usize,
+    pub result_scroll: usize,
+
+    // Logs
+    pub logs: Vec<LogEntry>,
+    pub log_scroll: usize,
+    pub auto_scroll_logs: bool,
+    pub max_log_entries: usize,
+
+    // Stats
+    pub bytes_transferred: u64,
+    pub connections_total: u64,
+    pub connections_active: u64,
+    pub requests_per_sec: f64,
+
+    // Misc
+    pub is_termux: bool,
+    pub show_help_popup: bool,
 }
 
-fn render_proxy_config(f: &mut Frame, state: &AppState, area: Rect) {
-    let is_editing = state.input_mode == InputMode::Editing;
+impl AppState {
+    pub fn new(config: &Config, is_termux: bool) -> Self {
+        Self {
+            active_tab: AppTab::Dashboard,
+            input_mode: InputMode::Normal,
+            active_field: ActiveField::Target,
 
-    let fields: [(&str, &str, usize); 3] = [
-        ("Target Host", &state.input_target, 0),
-        ("SNI Host   ", &state.input_sni, 1),
-        ("Port       ", &state.input_port, 2),
-    ];
+            field_target: InputField::new(&config.proxy.target_host),
+            field_sni: InputField::new(&config.proxy.sni_host),
+            field_port: InputField::new(config.proxy.port.to_string()),
 
-    let mut lines = vec![Line::from("")];
-    for (label, value, idx) in &fields {
-        let is_active = state.active_field == *idx;
-        let label_style = Style::default().fg(COLOR_DIM);
-        let (prefix, value_style) = if is_active && is_editing {
-            (
-                "▶ ",
-                Style::default()
-                    .fg(COLOR_HIGHLIGHT)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else if is_active {
-            (
-                "▶ ",
-                Style::default()
-                    .fg(COLOR_PRIMARY)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            ("  ", Style::default().fg(Color::White))
-        };
+            field_hosts_file: InputField::new(&config.scanner.hosts_file),
+            field_concurrency: InputField::new(
+                config.scanner.concurrency.to_string(),
+            ),
 
-        let display_value = if value.is_empty() {
-            format!("  {}<empty>", prefix)
-        } else if is_active && is_editing {
-            format!("  {}{}█", prefix, value)
-        } else {
-            format!("  {}{}", prefix, value)
-        };
+            target_host: config.proxy.target_host.clone(),
+            sni_host: config.proxy.sni_host.clone(),
+            proxy_port: config.proxy.port,
+            proxy_status: ProxyStatus::Stopped,
 
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {}: ", label), label_style),
-            Span::styled(display_value, value_style),
-        ]));
+            scan_status: ScanStatus::Idle,
+            scan_results: Vec::new(),
+            scan_progress: 0.0,
+            scan_total: 0,
+            scan_done: 0,
+
+            selected_result: 0,
+            result_scroll: 0,
+
+            logs: Vec::new(),
+            log_scroll: 0,
+            auto_scroll_logs: config.tui.auto_scroll_logs,
+            max_log_entries: config.tui.max_log_entries,
+
+            bytes_transferred: 0,
+            connections_total: 0,
+            connections_active: 0,
+            requests_per_sec: 0.0,
+
+            is_termux,
+            show_help_popup: config.tui.show_help_on_start,
+        }
     }
 
-    let border_color = if is_editing { COLOR_PRIMARY } else { COLOR_BORDER };
+    // ── Field access ──────────────────────────
 
-    let para = Paragraph::new(Text::from(lines))
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    " ⚙ Proxy Configuration ",
-                    Style::default()
-                        .fg(COLOR_PRIMARY)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(border_color)),
-        )
-        .wrap(Wrap { trim: true });
+    pub fn active_field_mut(&mut self) -> Option<&mut InputField> {
+        match self.active_field {
+            ActiveField::Target => Some(&mut self.field_target),
+            ActiveField::Sni => Some(&mut self.field_sni),
+            ActiveField::Port => Some(&mut self.field_port),
+            ActiveField::HostsFile => Some(&mut self.field_hosts_file),
+            ActiveField::Concurrency => Some(&mut self.field_concurrency),
+        }
+    }
 
-    f.render_widget(para, area);
+    pub fn field_index(&self) -> usize {
+        self.active_field.index(&self.active_tab)
+    }
+
+    // ── Logging ───────────────────────────────
+
+    pub fn add_log(&mut self, level: LogLevel, message: impl Into<String>) {
+        let now = chrono::Local::now();
+        self.logs.push(LogEntry {
+            timestamp: now.format("%H:%M:%S").to_string(),
+            level,
+            message: message.into(),
+        });
+        // Rolling window
+        if self.logs.len() > self.max_log_entries {
+            self.logs.drain(0..self.max_log_entries / 5);
+        }
+        if self.auto_scroll_logs {
+            self.log_scroll = self.logs.len().saturating_sub(1);
+        }
+    }
 }
 
-fn render_proxy_status(f: &mut Frame, state: &AppState, area: Rect) {
-    let (status_text, status_color, icon) = match &state.proxy_status {
-        ProxyStatus::Stopped => ("STOPPED", COLOR_DIM, "⏹"),
-        ProxyStatus::Starting => ("STARTING...", COLOR_WARNING, "⏳"),
-        ProxyStatus::Running => ("RUNNING", COLOR_SUCCESS, "▶"),
-        ProxyStatus::Error(_) => ("ERROR", COLOR_ERROR, "✗"),
-    };
+// ─────────────────────────────────────────────
+// Clipboard helper
+// ─────────────────────────────────────────────
 
-    let error_msg = if let ProxyStatus::Error(e) = &state.proxy_status {
-        e.clone()
+/// Try to get clipboard text.
+/// Uses `xclip`/`xsel` on Linux, `pbpaste` on macOS,
+/// `clip.exe` on Windows/WSL, `termux-clipboard-get` on Termux.
+fn get_clipboard(is_termux: bool) -> Option<String> {
+    let output = if is_termux {
+        std::process::Command::new("termux-clipboard-get")
+            .output()
+            .ok()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("pbpaste").output().ok()
+    } else if cfg!(target_os = "windows") {
+        // PowerShell clipboard
+        std::process::Command::new("powershell")
+            .args(["-command", "Get-Clipboard"])
+            .output()
+            .ok()
     } else {
-        String::new()
-    };
+        // Linux: try xclip then xsel
+        std::process::Command::new("xclip")
+            .args(["-selection", "clipboard", "-o"])
+            .output()
+            .ok()
+            .or_else(|| {
+                std::process::Command::new("xsel")
+                    .args(["--clipboard", "--output"])
+                    .output()
+                    .ok()
+            })
+            .or_else(|| {
+                // Wayland
+                std::process::Command::new("wl-paste")
+                    .output()
+                    .ok()
+            })
+    }?;
 
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  Status: ", Style::default().fg(COLOR_DIM)),
-            Span::styled(
-                format!("{} {} ", icon, status_text),
-                Style::default()
-                    .fg(status_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  Listen: ", Style::default().fg(COLOR_DIM)),
-            Span::styled(
-                format!("0.0.0.0:{}", state.proxy_port),
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  Target: ", Style::default().fg(COLOR_DIM)),
-            Span::styled(
-                if state.target_host.is_empty() {
-                    "<not set>".to_string()
-                } else {
-                    state.target_host.clone()
-                },
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  SNI:    ", Style::default().fg(COLOR_DIM)),
-            Span::styled(
-                if state.sni_host.is_empty() {
-                    "<not set>".to_string()
-                } else {
-                    state.sni_host.clone()
-                },
-                Style::default().fg(COLOR_HIGHLIGHT),
-            ),
-        ]),
-    ];
-
-    if !error_msg.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("  Error:  ", Style::default().fg(COLOR_ERROR)),
-            Span::styled(error_msg, Style::default().fg(COLOR_ERROR)),
-        ]));
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        None
     }
-
-    let action = match state.proxy_status {
-        ProxyStatus::Running => "[s] Stop",
-        _ => "[s] Start",
-    };
-
-    let para = Paragraph::new(Text::from(lines))
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    " ◈ Proxy Status ",
-                    Style::default()
-                        .fg(COLOR_PRIMARY)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .title_bottom(Span::styled(
-                    format!(" {} ", action),
-                    Style::default().fg(COLOR_DIM),
-                ))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(COLOR_BORDER)),
-        )
-        .wrap(Wrap { trim: true });
-
-    f.render_widget(para, area);
 }
 
-fn render_stats(f: &mut Frame, state: &AppState, area: Rect) {
-    let bytes = format_bytes(state.bytes_transferred);
-
-    let lines = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  ↕ Transferred : ", Style::default().fg(COLOR_DIM)),
-            Span::styled(bytes, Style::default().fg(COLOR_SUCCESS)),
-        ]),
-        Line::from(vec![
-            Span::styled("  ⇌ Active Conns : ", Style::default().fg(COLOR_DIM)),
-            Span::styled(
-                state.connections_active.to_string(),
-                Style::default().fg(COLOR_PRIMARY),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  ∑ Total Conns  : ", Style::default().fg(COLOR_DIM)),
-            Span::styled(
-                state.connections_total.to_string(),
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  ⚡ Req/sec      : ", Style::default().fg(COLOR_DIM)),
-            Span::styled(
-                format!("{:.1}", state.requests_per_sec),
-                Style::default().fg(COLOR_WARNING),
-            ),
-        ]),
-    ];
-
-    let para = Paragraph::new(Text::from(lines))
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    " ◈ Statistics ",
-                    Style::default()
-                        .fg(COLOR_PRIMARY)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(COLOR_BORDER)),
-        )
-        .wrap(Wrap { trim: true });
-
-    f.render_widget(para, area);
-}
-
-fn render_quick_actions(f: &mut Frame, state: &AppState, area: Rect) {
-    let is_termux = state.is_termux;
-
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  [1-5]  ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled("Switch tabs", Style::default().fg(Color::White)),
-        ]),
-        Line::from(vec![
-            Span::styled("  [e/i]  ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled("Edit fields", Style::default().fg(Color::White)),
-        ]),
-        Line::from(vec![
-            Span::styled("  [s]    ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled("Start/Stop proxy", Style::default().fg(Color::White)),
-        ]),
-        Line::from(vec![
-            Span::styled("  [S]    ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled("Start SNI scan", Style::default().fg(Color::White)),
-        ]),
-        Line::from(vec![
-            Span::styled("  [Tab]  ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled("Next tab/field", Style::default().fg(Color::White)),
-        ]),
-        Line::from(vec![
-            Span::styled("  [?]    ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled("Help popup", Style::default().fg(Color::White)),
-        ]),
-        Line::from(vec![
-            Span::styled("  [q]    ", Style::default().fg(COLOR_ERROR)),
-            Span::styled("Quit", Style::default().fg(Color::White)),
-        ]),
-    ];
-
+/// Try to set clipboard text.
+fn set_clipboard(text: &str, is_termux: bool) {
     if is_termux {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("  📱 ", Style::default()),
-            Span::styled(
-                "Termux mode active",
-                Style::default()
-                    .fg(COLOR_WARNING)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
-        lines.push(Line::from(vec![Span::styled(
-            "  Use hardware keyboard for best experience",
-            Style::default().fg(COLOR_DIM),
-        )]));
-    }
-
-    let para = Paragraph::new(Text::from(lines))
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    " ◈ Quick Reference ",
-                    Style::default()
-                        .fg(COLOR_PRIMARY)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(COLOR_BORDER)),
-        )
-        .wrap(Wrap { trim: true });
-
-    f.render_widget(para, area);
-}
-
-fn render_scanner(f: &mut Frame, state: &AppState, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(8),
-            Constraint::Length(5),
-            Constraint::Min(0),
-        ])
-        .split(area);
-
-    let is_editing = state.input_mode == InputMode::Editing
-        && state.active_tab == AppTab::Scanner;
-
-    let fields: [(&str, &str, usize); 2] = [
-        ("Hosts File  ", &state.input_hosts_file, 0),
-        ("Concurrency ", &state.input_concurrency, 1),
-    ];
-
-    let mut lines = vec![Line::from("")];
-    for (label, value, idx) in &fields {
-        let is_active = state.active_field == *idx;
-        let (prefix, value_style) = if is_active && is_editing {
-            (
-                "▶ ",
-                Style::default()
-                    .fg(COLOR_HIGHLIGHT)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else if is_active {
-            (
-                "▶ ",
-                Style::default()
-                    .fg(COLOR_PRIMARY)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            ("  ", Style::default().fg(Color::White))
-        };
-
-        let display = if is_active && is_editing {
-            format!("{}{}█", prefix, value)
-        } else {
-            format!("{}{}", prefix, value)
-        };
-
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {}: ", label),
-                Style::default().fg(COLOR_DIM),
-            ),
-            Span::styled(display, value_style),
-        ]));
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("  [e] Edit  ", Style::default().fg(COLOR_DIM)),
-        Span::styled("[S] Start Scan  ", Style::default().fg(COLOR_SUCCESS)),
-        Span::styled("[x] Stop Scan", Style::default().fg(COLOR_ERROR)),
-    ]));
-
-    let border_color = if is_editing { COLOR_PRIMARY } else { COLOR_BORDER };
-
-    let config_block = Paragraph::new(Text::from(lines))
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    " ◈ Scanner Configuration ",
-                    Style::default()
-                        .fg(COLOR_PRIMARY)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(border_color)),
-        );
-
-    f.render_widget(config_block, chunks[0]);
-
-    // Progress gauge
-    let (scan_label, gauge_color) = match &state.scan_status {
-        ScanStatus::Idle => ("Idle — Press [S] to start", COLOR_DIM),
-        ScanStatus::Running => ("Scanning...", COLOR_PRIMARY),
-        ScanStatus::Completed => ("Scan Complete!", COLOR_SUCCESS),
-        ScanStatus::Error(_) => ("Error", COLOR_ERROR),
-    };
-
-    let progress_ratio = state.scan_progress.clamp(0.0, 1.0);
-
-    let gauge = Gauge::default()
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    format!(
-                        " ◈ Progress [{}/{}] ",
-                        state.scan_done, state.scan_total
-                    ),
-                    Style::default()
-                        .fg(COLOR_PRIMARY)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(COLOR_BORDER)),
-        )
-        .gauge_style(
-            Style::default()
-                .fg(gauge_color)
-                .bg(Color::DarkGray),
-        )
-        .ratio(progress_ratio)
-        .label(format!(
-            "{} ({:.0}%)",
-            scan_label,
-            progress_ratio * 100.0
-        ));
-
-    f.render_widget(gauge, chunks[1]);
-
-    // Info panel
-    let working = state.scan_results.iter().filter(|r| r.is_working).count();
-    let total = state.scan_results.len();
-
-    let error_text = if let ScanStatus::Error(e) = &state.scan_status {
-        e.clone()
+        let _ = std::process::Command::new("termux-clipboard-set")
+            .arg(text)
+            .status();
+    } else if cfg!(target_os = "macos") {
+        let _ = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                c.stdin.as_mut().unwrap().write_all(text.as_bytes())?;
+                c.wait()
+            });
+    } else if cfg!(target_os = "windows") {
+        let _ = std::process::Command::new("powershell")
+            .args(["-command", &format!("Set-Clipboard '{}'", text)])
+            .status();
     } else {
-        String::new()
-    };
-
-    let mut info_lines = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  Results so far: ", Style::default().fg(COLOR_DIM)),
-            Span::styled(
-                format!("{} total, {} working", total, working),
-                Style::default().fg(COLOR_SUCCESS),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  Best latency:   ", Style::default().fg(COLOR_DIM)),
-            Span::styled(
-                state
-                    .scan_results
-                    .iter()
-                    .filter(|r| r.is_working)
-                    .map(|r| r.latency_ms)
-                    .min()
-                    .map(|ms| format!("{}ms", ms))
-                    .unwrap_or_else(|| "N/A".to_string()),
-                Style::default().fg(COLOR_WARNING),
-            ),
-        ]),
-        Line::from(vec![Span::styled(
-            "  Press [3] to view results, [u] to use selected SNI",
-            Style::default().fg(COLOR_DIM),
-        )]),
-    ];
-
-    if !error_text.is_empty() {
-        info_lines.push(Line::from(Span::styled(
-            format!("  Error: {}", error_text),
-            Style::default().fg(COLOR_ERROR),
-        )));
+        // Linux xclip
+        let _ = std::process::Command::new("xclip")
+            .args(["-selection", "clipboard"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                c.stdin.as_mut().unwrap().write_all(text.as_bytes())?;
+                c.wait()
+            })
+            .or_else(|_| {
+                std::process::Command::new("wl-copy")
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+                    .and_then(|mut c| {
+                        use std::io::Write;
+                        c.stdin.as_mut().unwrap().write_all(text.as_bytes())?;
+                        c.wait()
+                    })
+            });
     }
-
-    let info = Paragraph::new(Text::from(info_lines))
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    " ◈ Scanner Info ",
-                    Style::default()
-                        .fg(COLOR_PRIMARY)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(COLOR_BORDER)),
-        )
-        .wrap(Wrap { trim: true });
-
-    f.render_widget(info, chunks[2]);
 }
 
-fn render_results(f: &mut Frame, state: &AppState, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(3)])
-        .split(area);
+// ─────────────────────────────────────────────
+// App
+// ─────────────────────────────────────────────
 
-    let header_cells = ["#", "Host", "Latency", "Status", "TLS", "HTTP"]
-        .iter()
-        .map(|h| {
-            Cell::from(*h).style(
-                Style::default()
-                    .fg(COLOR_PRIMARY)
-                    .add_modifier(Modifier::BOLD),
-            )
+pub struct App {
+    pub state: Arc<Mutex<AppState>>,
+    event_tx: mpsc::UnboundedSender<AppEvent>,
+    event_rx: mpsc::UnboundedReceiver<AppEvent>,
+    proxy_handle: Option<tokio::task::JoinHandle<()>>,
+    scanner_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl App {
+    pub fn new(config: &Config, is_termux: bool) -> Result<Self> {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let state = Arc::new(Mutex::new(AppState::new(config, is_termux)));
+
+        Ok(Self {
+            state,
+            event_tx,
+            event_rx,
+            proxy_handle: None,
+            scanner_handle: None,
+        })
+    }
+
+    pub fn set_target(&mut self, target: String) {
+        let mut state = self.state.lock().unwrap();
+        state.field_target.set(&target);
+        state.target_host = target;
+    }
+
+    pub fn set_sni(&mut self, sni: String) {
+        let mut state = self.state.lock().unwrap();
+        state.field_sni.set(&sni);
+        state.sni_host = sni;
+    }
+
+    // ─────────────────────────────────────────
+    // Run
+    // ─────────────────────────────────────────
+
+    pub async fn run(mut self) -> Result<()> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend)?;
+
+        {
+            let mut state = self.state.lock().unwrap();
+            let is_termux = state.is_termux;
+            state.add_log(
+                LogLevel::Info,
+                format!(
+                    "SNI Bypass RS-TUI v{} started",
+                    env!("CARGO_PKG_VERSION")
+                ),
+            );
+            if is_termux {
+                state.add_log(
+                    LogLevel::Info,
+                    "Termux environment detected",
+                );
+            }
+            state.add_log(LogLevel::Info, "Press [?] for help");
+        }
+
+        let _event_handler = EventHandler::new(self.event_tx.clone());
+        let result = self.main_loop(&mut terminal).await;
+
+        disable_raw_mode()?;
+        execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        )?;
+        terminal.show_cursor()?;
+
+        if let Some(h) = self.proxy_handle {
+            h.abort();
+        }
+        if let Some(h) = self.scanner_handle {
+            h.abort();
+        }
+
+        result
+    }
+
+    // ─────────────────────────────────────────
+    // Main loop
+    // ─────────────────────────────────────────
+
+    async fn main_loop<B: ratatui::backend::Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+    ) -> Result<()> {
+        let tick = Duration::from_millis(16); // ~60fps
+
+        loop {
+            // Draw
+            {
+                let state = self.state.lock().unwrap();
+                terminal.draw(|f| ui::render(f, &state))?;
+            }
+
+            // Poll for input
+            if event::poll(tick)? {
+                match event::read()? {
+                    Event::Key(key) => {
+                        if !self.handle_key(key).await? {
+                            return Ok(());
+                        }
+                    }
+                    Event::Paste(text) => {
+                        self.handle_paste(text);
+                    }
+                    Event::Resize(_, _) => {
+                        // ratatui handles resize automatically
+                    }
+                    _ => {}
+                }
+            }
+
+            // Drain internal events
+            while let Ok(ev) = self.event_rx.try_recv() {
+                self.handle_app_event(ev).await?;
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────
+    // Paste handler
+    // ─────────────────────────────────────────
+
+    fn handle_paste(&mut self, text: String) {
+        let mut state = self.state.lock().unwrap();
+        if state.input_mode == InputMode::Editing {
+            if let Some(field) = state.active_field_mut() {
+                field.paste(&text);
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────
+    // Key dispatch
+    // ─────────────────────────────────────────
+
+    async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let mode = {
+            let state = self.state.lock().unwrap();
+            state.input_mode.clone()
+        };
+
+        match mode {
+            InputMode::Normal => self.handle_normal_key(key).await,
+            InputMode::Editing => self.handle_edit_key(key).await,
+        }
+    }
+
+    // ─────────────────────────────────────────
+    // Normal mode keys
+    // ─────────────────────────────────────────
+
+    async fn handle_normal_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        match key.code {
+            // ── Quit ──
+            KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(false),
+            KeyCode::Char('c') if ctrl => return Ok(false),
+
+            // ── Tab switching ──
+            KeyCode::Char('1') => self.set_tab(AppTab::Dashboard),
+            KeyCode::Char('2') => self.set_tab(AppTab::Scanner),
+            KeyCode::Char('3') => self.set_tab(AppTab::Results),
+            KeyCode::Char('4') => self.set_tab(AppTab::Logs),
+            KeyCode::Char('5') => self.set_tab(AppTab::Help),
+            KeyCode::Tab => self.next_tab(),
+            KeyCode::BackTab => self.prev_tab(),
+
+            // ── Help popup ──
+            KeyCode::Char('?') => {
+                let mut s = self.state.lock().unwrap();
+                s.show_help_popup = !s.show_help_popup;
+            }
+            KeyCode::Esc => {
+                let mut s = self.state.lock().unwrap();
+                if s.show_help_popup {
+                    s.show_help_popup = false;
+                }
+            }
+
+            // ── Enter edit mode ──
+            KeyCode::Char('e') | KeyCode::Char('i') => {
+                let mut s = self.state.lock().unwrap();
+                let tab = s.active_tab.clone();
+                if matches!(tab, AppTab::Dashboard | AppTab::Scanner) {
+                    s.input_mode = InputMode::Editing;
+                }
+            }
+
+            // ── Proxy / scan actions ──
+            KeyCode::Char('s') => self.toggle_proxy().await?,
+            KeyCode::Char('S') => self.start_scan().await?,
+            KeyCode::Char('x') => self.stop_scan(),
+
+            // ── Enter = context action ──
+            KeyCode::Enter => self.handle_enter().await?,
+
+            // ── Results: use selected SNI ──
+            KeyCode::Char('u') => self.use_selected_sni(),
+
+            // ── Field navigation (normal mode) ──
+            KeyCode::Char('n') => self.next_field(),
+            KeyCode::Char('p') => self.prev_field(),
+
+            // ── Scrolling ──
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_up(),
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_down(),
+            KeyCode::Left | KeyCode::Char('h') => self.scroll_left(),
+            KeyCode::Right | KeyCode::Char('l') => self.scroll_right(),
+            KeyCode::PageUp => self.page_up(),
+            KeyCode::PageDown => self.page_down(),
+            KeyCode::Home | KeyCode::Char('g') => self.scroll_top(),
+            KeyCode::End | KeyCode::Char('G') => self.scroll_bottom(),
+
+            // ── Log auto-scroll toggle ──
+            KeyCode::Char('a') => {
+                let mut s = self.state.lock().unwrap();
+                s.auto_scroll_logs = !s.auto_scroll_logs;
+            }
+
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    // ─────────────────────────────────────────
+    // Edit mode keys
+    // ─────────────────────────────────────────
+
+    async fn handle_edit_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        match key.code {
+            // ── Exit edit mode ──
+            KeyCode::Esc => {
+                let mut s = self.state.lock().unwrap();
+                s.input_mode = InputMode::Normal;
+            }
+
+            // ── Quit even in edit mode ──
+            KeyCode::Char('c') if ctrl => return Ok(false),
+
+            // ── Confirm + next field ──
+            KeyCode::Enter => {
+                self.next_field();
+            }
+
+            // ── Field navigation ──
+            KeyCode::Tab => self.next_field(),
+            KeyCode::BackTab => self.prev_field(),
+
+            // ── Cursor movement ──
+            KeyCode::Left => {
+                let mut s = self.state.lock().unwrap();
+                if let Some(f) = s.active_field_mut() {
+                    f.move_left();
+                }
+            }
+            KeyCode::Right => {
+                let mut s = self.state.lock().unwrap();
+                if let Some(f) = s.active_field_mut() {
+                    f.move_right();
+                }
+            }
+            KeyCode::Home => {
+                let mut s = self.state.lock().unwrap();
+                if let Some(f) = s.active_field_mut() {
+                    f.move_home();
+                }
+            }
+            KeyCode::End => {
+                let mut s = self.state.lock().unwrap();
+                if let Some(f) = s.active_field_mut() {
+                    f.move_end();
+                }
+            }
+
+            // Ctrl+A = home
+            KeyCode::Char('a') if ctrl => {
+                let mut s = self.state.lock().unwrap();
+                if let Some(f) = s.active_field_mut() {
+                    f.move_home();
+                }
+            }
+            // Ctrl+E = end
+            KeyCode::Char('e') if ctrl => {
+                let mut s = self.state.lock().unwrap();
+                if let Some(f) = s.active_field_mut() {
+                    f.move_end();
+                }
+            }
+
+            // ── Deletion ──
+            KeyCode::Backspace => {
+                let mut s = self.state.lock().unwrap();
+                if let Some(f) = s.active_field_mut() {
+                    f.delete_backward();
+                }
+            }
+            KeyCode::Delete => {
+                let mut s = self.state.lock().unwrap();
+                if let Some(f) = s.active_field_mut() {
+                    f.delete_forward();
+                }
+            }
+
+            // Ctrl+U = delete to start
+            KeyCode::Char('u') if ctrl => {
+                let mut s = self.state.lock().unwrap();
+                if let Some(f) = s.active_field_mut() {
+                    f.delete_to_start();
+                }
+            }
+            // Ctrl+K = delete to end
+            KeyCode::Char('k') if ctrl => {
+                let mut s = self.state.lock().unwrap();
+                if let Some(f) = s.active_field_mut() {
+                    f.delete_to_end();
+                }
+            }
+            // Ctrl+W = delete word backward
+            KeyCode::Char('w') if ctrl => {
+                let mut s = self.state.lock().unwrap();
+                if let Some(f) = s.active_field_mut() {
+                    f.delete_word_backward();
+                }
+            }
+
+            // ── Clipboard ──
+            // Ctrl+V or Ctrl+Y = paste
+            KeyCode::Char('v') if ctrl => {
+                let is_termux = {
+                    self.state.lock().unwrap().is_termux
+                };
+                if let Some(text) = get_clipboard(is_termux) {
+                    let mut s = self.state.lock().unwrap();
+                    if let Some(f) = s.active_field_mut() {
+                        f.paste(&text);
+                    }
+                }
+            }
+            KeyCode::Char('y') if ctrl => {
+                let is_termux = {
+                    self.state.lock().unwrap().is_termux
+                };
+                if let Some(text) = get_clipboard(is_termux) {
+                    let mut s = self.state.lock().unwrap();
+                    if let Some(f) = s.active_field_mut() {
+                        f.paste(&text);
+                    }
+                }
+            }
+
+            // Ctrl+C = copy current field value
+            KeyCode::Char('c') if ctrl => {
+                let (value, is_termux) = {
+                    let s = self.state.lock().unwrap();
+                    let val = match s.active_field {
+                        ActiveField::Target => s.field_target.value.clone(),
+                        ActiveField::Sni => s.field_sni.value.clone(),
+                        ActiveField::Port => s.field_port.value.clone(),
+                        ActiveField::HostsFile => {
+                            s.field_hosts_file.value.clone()
+                        }
+                        ActiveField::Concurrency => {
+                            s.field_concurrency.value.clone()
+                        }
+                    };
+                    (val, s.is_termux)
+                };
+                set_clipboard(&value, is_termux);
+                let mut s = self.state.lock().unwrap();
+                s.add_log(LogLevel::Info, "Copied to clipboard");
+            }
+
+            // ── Regular character input ──
+            KeyCode::Char(c) => {
+                let mut s = self.state.lock().unwrap();
+                if let Some(f) = s.active_field_mut() {
+                    f.insert(c);
+                }
+            }
+
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    // ─────────────────────────────────────────
+    // Tab helpers
+    // ─────────────────────────────────────────
+
+    fn set_tab(&mut self, tab: AppTab) {
+        let mut s = self.state.lock().unwrap();
+        let first = ActiveField::fields_for_tab(&tab)
+            .into_iter()
+            .next()
+            .unwrap_or(ActiveField::Target);
+        s.active_tab = tab;
+        s.active_field = first;
+        s.input_mode = InputMode::Normal;
+        s.show_help_popup = false;
+    }
+
+    fn next_tab(&mut self) {
+        let mut s = self.state.lock().unwrap();
+        let next = match s.active_tab {
+            AppTab::Dashboard => AppTab::Scanner,
+            AppTab::Scanner => AppTab::Results,
+            AppTab::Results => AppTab::Logs,
+            AppTab::Logs => AppTab::Help,
+            AppTab::Help => AppTab::Dashboard,
+        };
+        let first = ActiveField::fields_for_tab(&next)
+            .into_iter()
+            .next()
+            .unwrap_or(ActiveField::Target);
+        s.active_tab = next;
+        s.active_field = first;
+        s.input_mode = InputMode::Normal;
+    }
+
+    fn prev_tab(&mut self) {
+        let mut s = self.state.lock().unwrap();
+        let prev = match s.active_tab {
+            AppTab::Dashboard => AppTab::Help,
+            AppTab::Scanner => AppTab::Dashboard,
+            AppTab::Results => AppTab::Scanner,
+            AppTab::Logs => AppTab::Results,
+            AppTab::Help => AppTab::Logs,
+        };
+        let first = ActiveField::fields_for_tab(&prev)
+            .into_iter()
+            .next()
+            .unwrap_or(ActiveField::Target);
+        s.active_tab = prev;
+        s.active_field = first;
+        s.input_mode = InputMode::Normal;
+    }
+
+    // ─────────────────────────────────────────
+    // Field navigation
+    // ─────────────────────────────────────────
+
+    fn next_field(&mut self) {
+        let mut s = self.state.lock().unwrap();
+        let tab = s.active_tab.clone();
+        let fields = ActiveField::fields_for_tab(&tab);
+        if fields.is_empty() {
+            return;
+        }
+        s.active_field = s.active_field.next_in_tab(&tab);
+    }
+
+    fn prev_field(&mut self) {
+        let mut s = self.state.lock().unwrap();
+        let tab = s.active_tab.clone();
+        let fields = ActiveField::fields_for_tab(&tab);
+        if fields.is_empty() {
+            return;
+        }
+        s.active_field = s.active_field.prev_in_tab(&tab);
+    }
+
+    // ─────────────────────────────────────────
+    // Context Enter
+    // ─────────────────────────────────────────
+
+    async fn handle_enter(&mut self) -> Result<()> {
+        let (tab, mode) = {
+            let s = self.state.lock().unwrap();
+            (s.active_tab.clone(), s.input_mode.clone())
+        };
+
+        if mode == InputMode::Editing {
+            self.next_field();
+            return Ok(());
+        }
+
+        match tab {
+            AppTab::Dashboard => self.toggle_proxy().await?,
+            AppTab::Scanner => self.start_scan().await?,
+            AppTab::Results => self.use_selected_sni(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────
+    // Scroll helpers
+    // ─────────────────────────────────────────
+
+    fn scroll_up(&mut self) {
+        let mut s = self.state.lock().unwrap();
+        match s.active_tab {
+            AppTab::Results => {
+                if s.selected_result > 0 {
+                    s.selected_result -= 1;
+                    if s.selected_result < s.result_scroll {
+                        s.result_scroll = s.selected_result;
+                    }
+                }
+            }
+            AppTab::Logs => {
+                s.auto_scroll_logs = false;
+                s.log_scroll = s.log_scroll.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+
+    fn scroll_down(&mut self) {
+        let mut s = self.state.lock().unwrap();
+        match s.active_tab {
+            AppTab::Results => {
+                let max = s.scan_results.len().saturating_sub(1);
+                if s.selected_result < max {
+                    s.selected_result += 1;
+                    // Auto scroll viewport
+                    // (viewport height not known here; ui.rs handles clamping)
+                }
+            }
+            AppTab::Logs => {
+                let max = s.logs.len().saturating_sub(1);
+                if s.log_scroll < max {
+                    s.log_scroll += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn scroll_left(&mut self) {
+        // Reserved for future horizontal scroll
+    }
+
+    fn scroll_right(&mut self) {
+        // Reserved for future horizontal scroll
+    }
+
+    fn page_up(&mut self) {
+        let mut s = self.state.lock().unwrap();
+        match s.active_tab {
+            AppTab::Results => {
+                s.selected_result = s.selected_result.saturating_sub(10);
+                s.result_scroll = s.result_scroll.saturating_sub(10);
+            }
+            AppTab::Logs => {
+                s.auto_scroll_logs = false;
+                s.log_scroll = s.log_scroll.saturating_sub(10);
+            }
+            _ => {}
+        }
+    }
+
+    fn page_down(&mut self) {
+        let mut s = self.state.lock().unwrap();
+        match s.active_tab {
+            AppTab::Results => {
+                let max = s.scan_results.len().saturating_sub(1);
+                s.selected_result = (s.selected_result + 10).min(max);
+            }
+            AppTab::Logs => {
+                let max = s.logs.len().saturating_sub(1);
+                s.log_scroll = (s.log_scroll + 10).min(max);
+            }
+            _ => {}
+        }
+    }
+
+    fn scroll_top(&mut self) {
+        let mut s = self.state.lock().unwrap();
+        match s.active_tab {
+            AppTab::Results => {
+                s.selected_result = 0;
+                s.result_scroll = 0;
+            }
+            AppTab::Logs => {
+                s.auto_scroll_logs = false;
+                s.log_scroll = 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn scroll_bottom(&mut self) {
+        let mut s = self.state.lock().unwrap();
+        match s.active_tab {
+            AppTab::Results => {
+                let max = s.scan_results.len().saturating_sub(1);
+                s.selected_result = max;
+                s.result_scroll = max;
+            }
+            AppTab::Logs => {
+                s.log_scroll = s.logs.len().saturating_sub(1);
+                s.auto_scroll_logs = true;
+            }
+            _ => {}
+        }
+    }
+
+    // ─────────────────────────────────────────
+    // Proxy control
+    // ─────────────────────────────────────────
+
+    async fn toggle_proxy(&mut self) -> Result<()> {
+        let status = {
+            self.state.lock().unwrap().proxy_status.clone()
+        };
+        match status {
+            ProxyStatus::Stopped | ProxyStatus::Error(_) => {
+                self.start_proxy().await
+            }
+            ProxyStatus::Running => self.stop_proxy(),
+            ProxyStatus::Starting => Ok(()),
+        }
+    }
+
+    async fn start_proxy(&mut self) -> Result<()> {
+        let (target, sni, port) = {
+            let mut s = self.state.lock().unwrap();
+
+            let target = s.field_target.value.trim().to_string();
+            if target.is_empty() {
+                s.add_log(LogLevel::Error, "Target host is required");
+                return Ok(());
+            }
+
+            let sni = {
+                let v = s.field_sni.value.trim().to_string();
+                if v.is_empty() { target.clone() } else { v }
+            };
+
+            let port = s
+                .field_port
+                .value
+                .trim()
+                .parse::<u16>()
+                .unwrap_or(8080);
+
+            s.proxy_status = ProxyStatus::Starting;
+            s.target_host = target.clone();
+            s.sni_host = sni.clone();
+            s.proxy_port = port;
+
+            s.add_log(
+                LogLevel::Info,
+                format!("Starting proxy on port {}...", port),
+            );
+            s.add_log(
+                LogLevel::Info,
+                format!("Target: {} | SNI: {}", target, sni),
+            );
+
+            (target, sni, port)
+        };
+
+        let state_clone = Arc::clone(&self.state);
+        let event_tx = self.event_tx.clone();
+
+        let handle = tokio::spawn(async move {
+            let server = ProxyServer::new(port, target, sni);
+            match server
+                .run_with_stats(state_clone.clone(), event_tx)
+                .await
+            {
+                Ok(_) => {
+                    let mut s = state_clone.lock().unwrap();
+                    s.proxy_status = ProxyStatus::Stopped;
+                    s.add_log(LogLevel::Info, "Proxy stopped");
+                }
+                Err(e) => {
+                    let mut s = state_clone.lock().unwrap();
+                    s.proxy_status = ProxyStatus::Error(e.to_string());
+                    s.add_log(
+                        LogLevel::Error,
+                        format!("Proxy error: {}", e),
+                    );
+                }
+            }
         });
 
-    let header = Row::new(header_cells)
-        .style(Style::default().bg(Color::DarkGray))
-        .height(1);
+        self.proxy_handle = Some(handle);
 
-    let visible_start = state.result_scroll;
-
-    let rows: Vec<Row> = state
-        .scan_results
-        .iter()
-        .enumerate()
-        .skip(visible_start)
-        .map(|(idx, result)| {
-            let is_selected = idx == state.selected_result;
-            let row_style = if is_selected {
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .fg(COLOR_HIGHLIGHT)
-                    .add_modifier(Modifier::BOLD)
-            } else if result.is_working {
-                Style::default().fg(COLOR_SUCCESS)
-            } else {
-                Style::default().fg(COLOR_DIM)
-            };
-
-            let status_icon = if result.is_working { "✓" } else { "✗" };
-            let latency = if result.is_working {
-                format!("{}ms", result.latency_ms)
-            } else {
-                "timeout".to_string()
-            };
-            let tls = if result.tls_ok { "✓" } else { "✗" };
-            let http = if result.http_ok { "✓" } else { "✗" };
-
-            Row::new(vec![
-                Cell::from(format!("{:>3}", idx + 1)),
-                Cell::from(result.host.clone()),
-                Cell::from(latency),
-                Cell::from(status_icon),
-                Cell::from(tls),
-                Cell::from(http),
-            ])
-            .style(row_style)
-        })
-        .collect();
-
-    let working_count = state.scan_results.iter().filter(|r| r.is_working).count();
-    let title = format!(
-        " ◈ Scan Results [{}/{} working] ",
-        working_count,
-        state.scan_results.len()
-    );
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(4),
-            Constraint::Min(25),
-            Constraint::Length(10),
-            Constraint::Length(8),
-            Constraint::Length(6),
-            Constraint::Length(6),
-        ],
-    )
-    .header(header)
-    .block(
-        Block::default()
-            .title(Span::styled(
-                title,
-                Style::default()
-                    .fg(COLOR_PRIMARY)
-                    .add_modifier(Modifier::BOLD),
-            ))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(COLOR_BORDER)),
-    )
-    .column_spacing(1);
-
-    f.render_widget(table, chunks[0]);
-
-    let hint = Paragraph::new(Line::from(vec![
-        Span::styled(" [↑↓/jk] Navigate  ", Style::default().fg(COLOR_DIM)),
-        Span::styled(
-            "[u] Use selected SNI  ",
-            Style::default().fg(COLOR_PRIMARY),
-        ),
-        Span::styled("[PgUp/PgDn] Page  ", Style::default().fg(COLOR_DIM)),
-        Span::styled("[g/G] Top/Bottom", Style::default().fg(COLOR_DIM)),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(COLOR_BORDER)),
-    );
-
-    f.render_widget(hint, chunks[1]);
-}
-
-fn render_logs(f: &mut Frame, state: &AppState, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(3)])
-        .split(area);
-
-    let visible_height = chunks[0].height.saturating_sub(2) as usize;
-    let start = state.log_scroll;
-
-    let items: Vec<ListItem> = state
-        .logs
-        .iter()
-        .skip(start)
-        .take(visible_height)
-        .map(|entry| {
-            let (level_str, level_color) = match entry.level {
-                LogLevel::Info => ("[INFO]  ", COLOR_PRIMARY),
-                LogLevel::Success => ("[OK]    ", COLOR_SUCCESS),
-                LogLevel::Warning => ("[WARN]  ", COLOR_WARNING),
-                LogLevel::Error => ("[ERROR] ", COLOR_ERROR),
-            };
-
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!(" {} ", entry.timestamp),
-                    Style::default().fg(COLOR_DIM),
-                ),
-                Span::styled(
-                    level_str,
-                    Style::default().fg(level_color),
-                ),
-                Span::styled(
-                    &entry.message,
-                    Style::default().fg(Color::White),
-                ),
-            ]))
-        })
-        .collect();
-
-    let auto_scroll_indicator = if state.auto_scroll_logs {
-        "AUTO"
-    } else {
-        "MANUAL"
-    };
-
-    let log_list = List::new(items).block(
-        Block::default()
-            .title(Span::styled(
+        // Give it 150ms to bind then confirm
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut s = self.state.lock().unwrap();
+        if s.proxy_status == ProxyStatus::Starting {
+            s.proxy_status = ProxyStatus::Running;
+            s.add_log(
+                LogLevel::Success,
                 format!(
-                    " ◈ Logs [{}/{}] [{}] ",
-                    state.log_scroll + 1,
-                    state.logs.len(),
-                    auto_scroll_indicator
+                    "Proxy running on 127.0.0.1:{}",
+                    s.proxy_port
                 ),
-                Style::default()
-                    .fg(COLOR_PRIMARY)
-                    .add_modifier(Modifier::BOLD),
-            ))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(COLOR_BORDER)),
-    );
+            );
+        }
 
-    f.render_widget(log_list, chunks[0]);
+        Ok(())
+    }
 
-    let hint = Paragraph::new(Line::from(vec![
-        Span::styled(" [↑↓/jk] Scroll  ", Style::default().fg(COLOR_DIM)),
-        Span::styled(
-            "[a] Toggle auto-scroll  ",
-            Style::default().fg(COLOR_PRIMARY),
-        ),
-        Span::styled("[g/G] Top/Bottom", Style::default().fg(COLOR_DIM)),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(COLOR_BORDER)),
-    );
+    fn stop_proxy(&mut self) -> Result<()> {
+        if let Some(h) = self.proxy_handle.take() {
+            h.abort();
+        }
+        let mut s = self.state.lock().unwrap();
+        s.proxy_status = ProxyStatus::Stopped;
+        s.connections_active = 0;
+        s.add_log(LogLevel::Info, "Proxy stopped");
+        Ok(())
+    }
 
-    f.render_widget(hint, chunks[1]);
-}
+    // ─────────────────────────────────────────
+    // Scanner control
+    // ─────────────────────────────────────────
 
-fn render_help(f: &mut Frame, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
+    async fn start_scan(&mut self) -> Result<()> {
+        let already_running = {
+            self.state.lock().unwrap().scan_status == ScanStatus::Running
+        };
+        if already_running {
+            let mut s = self.state.lock().unwrap();
+            s.add_log(LogLevel::Warning, "Scanner already running");
+            return Ok(());
+        }
 
-    let nav_keys: Vec<(&str, &str)> = vec![
-        ("1-5", "Switch to tab"),
-        ("Tab / BackTab", "Next/prev tab"),
-        ("q / Ctrl+C", "Quit"),
-        ("?", "Toggle help popup"),
-        ("", ""),
-        ("── Navigation", ""),
-        ("↑↓ / j k", "Scroll up/down"),
-        ("PgUp / PgDn", "Page up/down"),
-        ("g / G", "Top / Bottom"),
-        ("", ""),
-        ("── Editing", ""),
-        ("e / i", "Enter edit mode"),
-        ("Esc", "Exit edit mode"),
-        ("Tab", "Next field"),
-        ("BackTab", "Prev field"),
-        ("Enter", "Confirm field"),
-    ];
+        let (hosts_file, concurrency) = {
+            let mut s = self.state.lock().unwrap();
+            let hosts_file =
+                s.field_hosts_file.value.trim().to_string();
+            let concurrency = s
+                .field_concurrency
+                .value
+                .trim()
+                .parse::<usize>()
+                .unwrap_or(50);
 
-    let action_keys: Vec<(&str, &str)> = vec![
-        ("── Proxy", ""),
-        ("s", "Start/Stop proxy"),
-        ("", ""),
-        ("── Scanner", ""),
-        ("S", "Start scan"),
-        ("x", "Stop scan"),
-        ("u", "Use selected SNI"),
-        ("", ""),
-        ("── Logs", ""),
-        ("a", "Toggle auto-scroll"),
-        ("", ""),
-        ("── Dashboard", ""),
-        ("n / p", "Next/prev field"),
-    ];
+            s.scan_status = ScanStatus::Running;
+            s.scan_results.clear();
+            s.scan_progress = 0.0;
+            s.scan_done = 0;
+            s.scan_total = 0;
 
-    let make_items = |keys: Vec<(&str, &str)>| -> Vec<ListItem<'static>> {
-        keys.into_iter()
-            .map(|(key, desc)| {
-                if key.is_empty() {
-                    ListItem::new(Line::from(""))
-                } else if desc.is_empty() {
-                    ListItem::new(Line::from(vec![Span::styled(
-                        format!("  {} ", key),
-                        Style::default()
-                            .fg(COLOR_DIM)
-                            .add_modifier(Modifier::BOLD),
-                    )]))
-                } else {
-                    ListItem::new(Line::from(vec![
-                        Span::styled(
-                            format!("  {:15}", key),
-                            Style::default().fg(COLOR_PRIMARY),
-                        ),
-                        Span::styled(
-                            desc.to_string(),
-                            Style::default().fg(Color::White),
-                        ),
-                    ]))
+            s.add_log(
+                LogLevel::Info,
+                format!(
+                    "Scanning '{}' with concurrency {}",
+                    hosts_file, concurrency
+                ),
+            );
+
+            (hosts_file, concurrency)
+        };
+
+        let state_clone = Arc::clone(&self.state);
+        let event_tx_main = self.event_tx.clone();
+
+        let handle = tokio::spawn(async move {
+            let scanner = SniScanner::new(concurrency);
+
+            // Read hosts file
+            let hosts = match tokio::fs::read_to_string(&hosts_file).await
+            {
+                Ok(content) => content
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| {
+                        !l.is_empty() && !l.starts_with('#')
+                    })
+                    .collect::<Vec<_>>(),
+                Err(e) => {
+                    let mut s = state_clone.lock().unwrap();
+                    s.scan_status =
+                        ScanStatus::Error(e.to_string());
+                    s.add_log(
+                        LogLevel::Error,
+                        format!("Cannot read '{}': {}", hosts_file, e),
+                    );
+                    return;
                 }
-            })
-            .collect()
-    };
+            };
 
-    let nav_list = List::new(make_items(nav_keys)).block(
-        Block::default()
-            .title(Span::styled(
-                " ◈ Navigation Keys ",
-                Style::default()
-                    .fg(COLOR_PRIMARY)
-                    .add_modifier(Modifier::BOLD),
-            ))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(COLOR_BORDER)),
-    );
+            if hosts.is_empty() {
+                let mut s = state_clone.lock().unwrap();
+                s.scan_status = ScanStatus::Error(
+                    "Hosts file is empty".to_string(),
+                );
+                s.add_log(
+                    LogLevel::Error,
+                    "Hosts file is empty or has no valid entries",
+                );
+                return;
+            }
 
-    let action_list = List::new(make_items(action_keys)).block(
-        Block::default()
-            .title(Span::styled(
-                " ◈ Action Keys ",
-                Style::default()
-                    .fg(COLOR_PRIMARY)
-                    .add_modifier(Modifier::BOLD),
-            ))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(COLOR_BORDER)),
-    );
+            {
+                let mut s = state_clone.lock().unwrap();
+                s.scan_total = hosts.len();
+                s.add_log(
+                    LogLevel::Info,
+                    format!("Found {} hosts to scan", hosts.len()),
+                );
+            }
 
-    f.render_widget(nav_list, chunks[0]);
-    f.render_widget(action_list, chunks[1]);
-}
+            let _ = event_tx_main.send(AppEvent::ScanStarted(hosts.len()));
 
-fn render_help_popup(f: &mut Frame, area: Rect) {
-    let popup_area = centered_rect(60, 70, area);
+            // Per-result callback — clone tx for the closure
+            let event_tx_cb = event_tx_main.clone();
 
-    f.render_widget(Clear, popup_area);
+            let results = scanner
+                .scan_hosts(hosts, move |result| {
+                    let _ = event_tx_cb
+                        .send(AppEvent::ScanResult(result));
+                })
+                .await;
 
-    let help_text = vec![
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  SNI Bypass RS-TUI — Quick Help",
-            Style::default()
-                .fg(COLOR_PRIMARY)
-                .add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  ── Setup ──",
-            Style::default().fg(COLOR_DIM),
-        )]),
-        Line::from(vec![
-            Span::styled("  1. ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled(
-                "Go to Dashboard [1]",
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  2. ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled(
-                "Edit target host [e]",
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  3. ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled(
-                "Set SNI (or leave same as target)",
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  4. ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled(
-                "Press [s] to start proxy",
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  5. ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled(
-                "Set device proxy to 127.0.0.1:<port>",
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  ── SNI Scanner ──",
-            Style::default().fg(COLOR_DIM),
-        )]),
-        Line::from(vec![
-            Span::styled("  1. ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled(
-                "Go to Scanner tab [2]",
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  2. ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled(
-                "Set hosts file path [e]",
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  3. ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled(
-                "Press [S] to start scan",
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  4. ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled(
-                "View results in Results tab [3]",
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  5. ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled(
-                "Press [u] to use selected SNI",
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  ── Termux ──",
-            Style::default().fg(COLOR_DIM),
-        )]),
-        Line::from(vec![Span::styled(
-            "  pkg install rust",
-            Style::default().fg(COLOR_WARNING),
-        )]),
-        Line::from(vec![Span::styled(
-            "  cargo build --release",
-            Style::default().fg(COLOR_WARNING),
-        )]),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  Press [?] to close",
-            Style::default().fg(COLOR_DIM),
-        )]),
-    ];
+            // Final summary
+            let working =
+                results.iter().filter(|r| r.is_working).count();
 
-    let popup = Paragraph::new(Text::from(help_text))
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    " ◈ Help [?] ",
-                    Style::default()
-                        .fg(COLOR_PRIMARY)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Double)
-                .border_style(Style::default().fg(COLOR_PRIMARY)),
-        )
-        .wrap(Wrap { trim: true });
+            {
+                let mut s = state_clone.lock().unwrap();
+                s.scan_status = ScanStatus::Completed;
+                s.scan_progress = 1.0;
+                s.add_log(
+                    LogLevel::Success,
+                    format!(
+                        "Scan complete — {}/{} hosts working",
+                        working,
+                        results.len()
+                    ),
+                );
+            }
 
-    f.render_widget(popup, popup_area);
-}
+            let _ = event_tx_main.send(AppEvent::ScanCompleted);
+        });
 
-fn render_statusbar(f: &mut Frame, state: &AppState, area: Rect) {
-    let mode_str = match state.input_mode {
-        InputMode::Normal => "NORMAL",
-        InputMode::Editing => "EDIT",
-    };
-    let mode_color = match state.input_mode {
-        InputMode::Normal => COLOR_PRIMARY,
-        InputMode::Editing => COLOR_WARNING,
-    };
+        self.scanner_handle = Some(handle);
 
-    let proxy_indicator = match &state.proxy_status {
-        ProxyStatus::Running => Span::styled(
-            " ▶ PROXY ON  ",
-            Style::default().fg(COLOR_BG).bg(COLOR_SUCCESS),
-        ),
-        ProxyStatus::Error(_) => Span::styled(
-            " ✗ PROXY ERR ",
-            Style::default().fg(COLOR_BG).bg(COLOR_ERROR),
-        ),
-        _ => Span::styled(
-            " ⏹ PROXY OFF ",
-            Style::default().fg(COLOR_BG).bg(COLOR_DIM),
-        ),
-    };
+        // Switch to Results tab so user sees live results
+        {
+            let mut s = self.state.lock().unwrap();
+            s.active_tab = AppTab::Results;
+        }
 
-    let scan_indicator = match state.scan_status {
-        ScanStatus::Running => Span::styled(
-            " ⟳ SCANNING ",
-            Style::default().fg(COLOR_BG).bg(COLOR_PRIMARY),
-        ),
-        ScanStatus::Completed => Span::styled(
-            " ✓ SCAN DONE ",
-            Style::default().fg(COLOR_BG).bg(COLOR_SUCCESS),
-        ),
-        _ => Span::styled("", Style::default()),
-    };
+        Ok(())
+    }
 
-    let termux_ind = if state.is_termux {
-        Span::styled(" 📱 TERMUX ", Style::default().fg(COLOR_WARNING))
-    } else {
-        Span::styled("", Style::default())
-    };
+    fn stop_scan(&mut self) {
+        if let Some(h) = self.scanner_handle.take() {
+            h.abort();
+        }
+        let mut s = self.state.lock().unwrap();
+        if s.scan_status == ScanStatus::Running {
+            s.scan_status = ScanStatus::Idle;
+            s.add_log(LogLevel::Warning, "Scan stopped by user");
+        }
+    }
 
-    let status_line = Line::from(vec![
-        Span::styled(
-            format!(" {} ", mode_str),
-            Style::default()
-                .fg(COLOR_BG)
-                .bg(mode_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        proxy_indicator,
-        Span::raw(" "),
-        scan_indicator,
-        Span::styled(
-            "  [q]uit  [?]help  [Tab]navigate",
-            Style::default().fg(COLOR_DIM),
-        ),
-        termux_ind,
-    ]);
+    // ─────────────────────────────────────────
+    // Use selected SNI
+    // ─────────────────────────────────────────
 
-    let statusbar =
-        Paragraph::new(status_line).style(Style::default().bg(COLOR_BG));
+    fn use_selected_sni(&mut self) {
+        let selected = {
+            let s = self.state.lock().unwrap();
+            s.scan_results.get(s.selected_result).cloned()
+        };
 
-    f.render_widget(statusbar, area);
-}
+        if let Some(result) = selected {
+            if result.is_working {
+                let mut s = self.state.lock().unwrap();
+                s.field_sni.set(&result.host);
+                s.sni_host = result.host.clone();
+                s.active_tab = AppTab::Dashboard;
+                s.active_field = ActiveField::Target;
+                s.add_log(
+                    LogLevel::Success,
+                    format!("SNI set to: {}", result.host),
+                );
+            } else {
+                let mut s = self.state.lock().unwrap();
+                s.add_log(
+                    LogLevel::Warning,
+                    "Selected host is not working — pick a ✓ host",
+                );
+            }
+        }
+    }
 
-// ─────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────
+    // ─────────────────────────────────────────
+    // Internal event handler
+    // ─────────────────────────────────────────
 
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
+    async fn handle_app_event(&mut self, event: AppEvent) -> Result<()> {
+        match event {
+            AppEvent::ScanResult(result) => {
+                let mut s = self.state.lock().unwrap();
+                s.scan_done += 1;
+                if s.scan_total > 0 {
+                    s.scan_progress =
+                        s.scan_done as f64 / s.scan_total as f64;
+                }
+                if result.is_working {
+                    s.add_log(
+                        LogLevel::Success,
+                        format!(
+                            "✓ {} — {}ms",
+                            result.host, result.latency_ms
+                        ),
+                    );
+                }
+                s.scan_results.push(result);
+                // Sort: working first, then by latency ascending
+                s.scan_results.sort_by(|a, b| {
+                    b.is_working
+                        .cmp(&a.is_working)
+                        .then(a.latency_ms.cmp(&b.latency_ms))
+                });
+            }
 
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}
+            AppEvent::ScanStarted(total) => {
+                let mut s = self.state.lock().unwrap();
+                s.scan_total = total;
+            }
 
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
+            AppEvent::ScanCompleted => {
+                let mut s = self.state.lock().unwrap();
+                s.scan_status = ScanStatus::Completed;
+                s.scan_progress = 1.0;
+            }
 
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
+            AppEvent::ProxyConnection { bytes, active } => {
+                let mut s = self.state.lock().unwrap();
+                s.bytes_transferred += bytes;
+                s.connections_active = active;
+                if bytes > 0 {
+                    s.connections_total += 1;
+                }
+            }
+
+            AppEvent::Log(level, msg) => {
+                let mut s = self.state.lock().unwrap();
+                s.add_log(level, msg);
+            }
+        }
+        Ok(())
     }
 }
