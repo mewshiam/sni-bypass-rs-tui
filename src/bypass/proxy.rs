@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
@@ -17,9 +17,14 @@ pub struct ProxyServer {
 
 impl ProxyServer {
     pub fn new(port: u16, target_host: String, sni_host: String) -> Self {
-        Self { port, target_host, sni_host }
+        Self {
+            port,
+            target_host,
+            sni_host,
+        }
     }
 
+    /// Headless mode — no stats tracking
     pub async fn run(self) -> Result<()> {
         let addr = format!("0.0.0.0:{}", self.port);
         let listener = TcpListener::bind(&addr).await?;
@@ -34,16 +39,22 @@ impl ProxyServer {
             let sni = Arc::clone(&sni);
 
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(client, &target, &sni, peer.to_string()).await {
-                    tracing::error!("Connection error from {}: {}", peer, e);
+                if let Err(e) =
+                    handle_connection(client, &target, &sni).await
+                {
+                    tracing::error!(
+                        "Connection error from {}: {}",
+                        peer, e
+                    );
                 }
             });
         }
     }
 
+    /// TUI mode — tracks stats and sends events
     pub async fn run_with_stats(
         self,
-        state: Arc<Mutex<AppState>>,
+        _state: Arc<Mutex<AppState>>,
         event_tx: mpsc::UnboundedSender<AppEvent>,
     ) -> Result<()> {
         let addr = format!("0.0.0.0:{}", self.port);
@@ -52,7 +63,7 @@ impl ProxyServer {
         let sni = Arc::new(self.sni_host);
         let active_conns = Arc::new(AtomicU64::new(0));
 
-        tracing::info!("Proxy with stats listening on {}", addr);
+        tracing::info!("Proxy (with stats) listening on {}", addr);
 
         loop {
             let (client, peer) = listener.accept().await?;
@@ -62,48 +73,49 @@ impl ProxyServer {
             let active = Arc::clone(&active_conns);
 
             tokio::spawn(async move {
-                active.fetch_add(1, Ordering::Relaxed);
-                let active_count = active.load(Ordering::Relaxed);
-
+                let current = active.fetch_add(1, Ordering::Relaxed) + 1;
                 let _ = event_tx.send(AppEvent::ProxyConnection {
                     bytes: 0,
-                    active: active_count,
+                    active: current,
                 });
 
-                match handle_connection(client, &target, &sni, peer.to_string()).await {
-                    Ok(bytes) => {
-                        let active_count = active.fetch_sub(1, Ordering::Relaxed) - 1;
-                        let _ = event_tx.send(AppEvent::ProxyConnection {
-                            bytes,
-                            active: active_count,
-                        });
-                    }
-                    Err(e) => {
-                        let active_count = active.fetch_sub(1, Ordering::Relaxed) - 1;
-                        tracing::error!("Error from {}: {}", peer, e);
-                        let _ = event_tx.send(AppEvent::ProxyConnection {
-                            bytes: 0,
-                            active: active_count,
-                        });
-                    }
-                }
+                let bytes =
+                    match handle_connection(client, &target, &sni).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::error!(
+                                "Error from {}: {}",
+                                peer, e
+                            );
+                            0
+                        }
+                    };
+
+                let current = active.fetch_sub(1, Ordering::Relaxed) - 1;
+                let _ = event_tx.send(AppEvent::ProxyConnection {
+                    bytes,
+                    active: current,
+                });
             });
         }
     }
 }
 
+// ─────────────────────────────────────────────
+// Connection handler
+// ─────────────────────────────────────────────
+
 async fn handle_connection(
     mut client: TcpStream,
     target: &str,
     sni: &str,
-    peer: String,
 ) -> Result<u64> {
-    use rustls::{ClientConfig, RootCertStore};
-    use tokio_rustls::TlsConnector;
-
-    // Read CONNECT request or first bytes
-    let mut buf = [0u8; 4096];
-    let n = timeout(Duration::from_secs(10), client.read(&mut buf)).await??;
+    let mut buf = vec![0u8; 4096];
+    let n = timeout(
+        Duration::from_secs(10),
+        client.read(&mut buf),
+    )
+    .await??;
 
     if n == 0 {
         return Ok(0);
@@ -111,15 +123,21 @@ async fn handle_connection(
 
     let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
 
-    // Handle HTTP CONNECT (for HTTPS proxy)
     if request.starts_with("CONNECT") {
-        let _ = client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await;
-        return handle_tls_tunnel(client, target, sni).await;
+        // HTTPS tunnel
+        client
+            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            .await?;
+        handle_tls_tunnel(client, target, sni).await
+    } else {
+        // Plain HTTP
+        handle_http_proxy(client, target, &buf[..n]).await
     }
-
-    // Handle direct HTTP
-    handle_http_proxy(client, target, &buf[..n]).await
 }
+
+// ─────────────────────────────────────────────
+// TLS tunnel (SNI bypass)
+// ─────────────────────────────────────────────
 
 async fn handle_tls_tunnel(
     mut client: TcpStream,
@@ -127,9 +145,9 @@ async fn handle_tls_tunnel(
     sni: &str,
 ) -> Result<u64> {
     use rustls::{ClientConfig, RootCertStore};
+    use std::sync::Arc as StdArc;
     use tokio_rustls::TlsConnector;
 
-    // Connect to upstream with SNI bypass
     let addr = format!("{}:443", target);
     let upstream = TcpStream::connect(&addr).await?;
 
@@ -140,43 +158,35 @@ async fn handle_tls_tunnel(
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
-    let connector = TlsConnector::from(Arc::new(config));
-    let server_name = rustls::pki_types::ServerName::try_from(sni.to_string())?;
+    let connector = TlsConnector::from(StdArc::new(config));
+    let server_name =
+        rustls::pki_types::ServerName::try_from(sni.to_string())?;
 
     let mut tls_upstream = connector.connect(server_name, upstream).await?;
 
-    // Bidirectional copy
-    let (client_read, client_write) = client.split();
-    // For simplicity, do raw bidirectional copy
-    let mut bytes = 0u64;
-
-    // Use tokio copy_bidirectional workaround for TLS
-    // We'll do a simple manual approach
+    // Two separate buffers — one per direction — fixes E0499
     let mut client_buf = vec![0u8; 8192];
     let mut upstream_buf = vec![0u8; 8192];
+    let mut bytes: u64 = 0;
 
-    // This is a simplified version - in production you'd want
-    // proper bidirectional async copying
     loop {
         tokio::select! {
             result = client.read(&mut client_buf) => {
                 match result {
-                    Ok(0) => break,
+                    Ok(0) | Err(_) => break,
                     Ok(n) => {
                         tls_upstream.write_all(&client_buf[..n]).await?;
                         bytes += n as u64;
                     }
-                    Err(_) => break,
                 }
             }
             result = tls_upstream.read(&mut upstream_buf) => {
                 match result {
-                    Ok(0) => break,
+                    Ok(0) | Err(_) => break,
                     Ok(n) => {
                         client.write_all(&upstream_buf[..n]).await?;
                         bytes += n as u64;
                     }
-                    Err(_) => break,
                 }
             }
         }
@@ -184,6 +194,10 @@ async fn handle_tls_tunnel(
 
     Ok(bytes)
 }
+
+// ─────────────────────────────────────────────
+// Plain HTTP proxy
+// ─────────────────────────────────────────────
 
 async fn handle_http_proxy(
     mut client: TcpStream,
@@ -194,25 +208,27 @@ async fn handle_http_proxy(
     let mut upstream = TcpStream::connect(&addr).await?;
     upstream.write_all(request).await?;
 
-    let mut bytes = 0u64;
-    let mut buf = vec![0u8; 8192];
+    // Two separate buffers — one per direction
+    let mut client_buf = vec![0u8; 8192];
+    let mut upstream_buf = vec![0u8; 8192];
+    let mut bytes: u64 = 0;
 
     loop {
         tokio::select! {
-            n = client.read(&mut buf) => {
+            n = client.read(&mut client_buf) => {
                 match n {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        upstream.write_all(&buf[..n]).await?;
+                        upstream.write_all(&client_buf[..n]).await?;
                         bytes += n as u64;
                     }
                 }
             }
-            n = upstream.read(&mut buf) => {
+            n = upstream.read(&mut upstream_buf) => {
                 match n {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        client.write_all(&buf[..n]).await?;
+                        client.write_all(&upstream_buf[..n]).await?;
                         bytes += n as u64;
                     }
                 }
