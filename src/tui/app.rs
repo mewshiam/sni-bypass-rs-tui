@@ -1,3 +1,5 @@
+// src/tui/app.rs
+
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -16,6 +18,11 @@ use super::ui;
 use super::events::{AppEvent, EventHandler};
 use crate::scanner::{SniScanner, ScanResult};
 use crate::bypass::ProxyServer;
+use crate::Config; // ← import Config from main.rs
+
+// ─────────────────────────────────────────────
+// Types
+// ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppTab {
@@ -63,6 +70,10 @@ pub enum ScanStatus {
     Error(String),
 }
 
+// ─────────────────────────────────────────────
+// AppState
+// ─────────────────────────────────────────────
+
 pub struct AppState {
     // Navigation
     pub active_tab: AppTab,
@@ -102,7 +113,7 @@ pub struct AppState {
     pub connections_active: u64,
     pub requests_per_sec: f64,
 
-    // Termux specific
+    // Termux
     pub is_termux: bool,
     pub show_help_popup: bool,
 }
@@ -158,6 +169,10 @@ impl AppState {
     }
 }
 
+// ─────────────────────────────────────────────
+// App
+// ─────────────────────────────────────────────
+
 pub struct App {
     pub state: Arc<Mutex<AppState>>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
@@ -167,9 +182,23 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(port: u16, is_termux: bool) -> Result<Self> {
+    // ─────────────────────────────────────────
+    // ↓↓↓ THIS IS WHERE THE NEW new() GOES ↓↓↓
+    // ─────────────────────────────────────────
+    pub fn new(config: &Config, is_termux: bool) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let state = Arc::new(Mutex::new(AppState::new(port, is_termux)));
+
+        // Build state from config
+        let mut state = AppState::new(config.proxy.port, is_termux);
+
+        // Pre-fill scanner fields from config
+        state.input_hosts_file = config.scanner.hosts_file.clone();
+        state.input_concurrency = config.scanner.concurrency.to_string();
+
+        // Pre-fill TUI preferences from config
+        state.auto_scroll_logs = config.tui.auto_scroll_logs;
+
+        let state = Arc::new(Mutex::new(state));
 
         Ok(Self {
             state,
@@ -192,15 +221,17 @@ impl App {
         state.sni_host = sni;
     }
 
+    // ─────────────────────────────────────────
+    // Run
+    // ─────────────────────────────────────────
+
     pub async fn run(mut self) -> Result<()> {
-        // Setup terminal
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        // Log startup
         {
             let mut state = self.state.lock().unwrap();
             let is_termux = state.is_termux;
@@ -211,7 +242,6 @@ impl App {
             state.add_log(LogLevel::Info, "Press '?' for help");
         }
 
-        // Start event handler
         let event_tx = self.event_tx.clone();
         let _event_handler = EventHandler::new(event_tx.clone());
 
@@ -226,7 +256,7 @@ impl App {
         )?;
         terminal.show_cursor()?;
 
-        // Cleanup background tasks
+        // Cleanup
         if let Some(handle) = self.proxy_handle {
             handle.abort();
         }
@@ -237,18 +267,20 @@ impl App {
         result
     }
 
+    // ─────────────────────────────────────────
+    // Main loop
+    // ─────────────────────────────────────────
+
     async fn main_loop<B: ratatui::backend::Backend>(
         &mut self,
         terminal: &mut Terminal<B>,
     ) -> Result<()> {
         loop {
-            // Draw UI
             {
                 let state = self.state.lock().unwrap();
                 terminal.draw(|f| ui::render(f, &state))?;
             }
 
-            // Handle events with timeout
             if event::poll(Duration::from_millis(50))? {
                 if let Event::Key(key) = event::read()? {
                     if !self.handle_key(key.code, key.modifiers).await? {
@@ -257,12 +289,15 @@ impl App {
                 }
             }
 
-            // Process internal events
             while let Ok(event) = self.event_rx.try_recv() {
                 self.handle_app_event(event).await?;
             }
         }
     }
+
+    // ─────────────────────────────────────────
+    // Key handling
+    // ─────────────────────────────────────────
 
     async fn handle_key(
         &mut self,
@@ -286,25 +321,25 @@ impl App {
         modifiers: KeyModifiers,
     ) -> Result<bool> {
         match key {
-            // Quit
             KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(false),
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
                 return Ok(false);
             }
 
-            // Tab navigation
+            // Tab switching
             KeyCode::Char('1') => self.set_tab(AppTab::Dashboard),
             KeyCode::Char('2') => self.set_tab(AppTab::Scanner),
             KeyCode::Char('3') => self.set_tab(AppTab::Results),
             KeyCode::Char('4') => self.set_tab(AppTab::Logs),
-            KeyCode::Char('5') | KeyCode::Char('?') => {
+            KeyCode::Char('5') => self.set_tab(AppTab::Help),
+            KeyCode::Char('?') => {
                 let mut state = self.state.lock().unwrap();
                 state.show_help_popup = !state.show_help_popup;
             }
             KeyCode::Tab => self.next_tab(),
             KeyCode::BackTab => self.prev_tab(),
 
-            // Actions based on current tab
+            // Actions
             KeyCode::Enter => self.handle_enter().await?,
             KeyCode::Char('e') | KeyCode::Char('i') => {
                 let mut state = self.state.lock().unwrap();
@@ -322,11 +357,11 @@ impl App {
             KeyCode::Char('g') => self.scroll_top(),
             KeyCode::Char('G') => self.scroll_bottom(),
 
-            // Next field in editing
+            // Field navigation
             KeyCode::Char('n') => self.next_field(),
             KeyCode::Char('p') => self.prev_field(),
 
-            // Use selected SNI from results
+            // Use SNI from results
             KeyCode::Char('u') => self.use_selected_sni(),
 
             // Toggle log auto-scroll
@@ -352,50 +387,55 @@ impl App {
             }
             KeyCode::Enter => {
                 let mut state = self.state.lock().unwrap();
+                let count = Self::field_count_for(&state);
                 state.input_mode = InputMode::Normal;
-                // Move to next field
-                state.active_field = (state.active_field + 1) % self.field_count(&state);
+                state.active_field = (state.active_field + 1) % count;
             }
             KeyCode::Tab => {
                 let mut state = self.state.lock().unwrap();
-                let count = self.field_count(&state);
+                let count = Self::field_count_for(&state);
                 state.active_field = (state.active_field + 1) % count;
             }
             KeyCode::BackTab => {
                 let mut state = self.state.lock().unwrap();
-                let count = self.field_count(&state);
-                state.active_field = state.active_field.saturating_sub(1);
-                if state.active_field == 0 && count > 0 {
-                    // wrap handled by saturating_sub
+                let count = Self::field_count_for(&state);
+                if state.active_field == 0 {
+                    state.active_field = count - 1;
+                } else {
+                    state.active_field -= 1;
                 }
             }
-            KeyCode::Char(c) if modifiers.contains(KeyModifiers::CONTROL) => {
-                if c == 'c' {
-                    return Ok(false);
-                }
+            KeyCode::Char('c')
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                return Ok(false);
             }
             KeyCode::Char(c) => {
                 let mut state = self.state.lock().unwrap();
-                self.push_char_to_field(&mut state, c);
+                Self::push_char(&mut state, c);
             }
             KeyCode::Backspace => {
                 let mut state = self.state.lock().unwrap();
-                self.pop_char_from_field(&mut state);
+                Self::pop_char(&mut state);
             }
             _ => {}
         }
         Ok(true)
     }
 
-    fn field_count(&self, state: &AppState) -> usize {
+    // ─────────────────────────────────────────
+    // Field helpers (static so no borrow issues)
+    // ─────────────────────────────────────────
+
+    fn field_count_for(state: &AppState) -> usize {
         match state.active_tab {
-            AppTab::Dashboard => 3, // target, sni, port
-            AppTab::Scanner => 2,   // hosts_file, concurrency
+            AppTab::Dashboard => 3,
+            AppTab::Scanner => 2,
             _ => 1,
         }
     }
 
-    fn push_char_to_field(&self, state: &mut AppState, c: char) {
+    fn push_char(state: &mut AppState, c: char) {
         match state.active_tab {
             AppTab::Dashboard => match state.active_field {
                 0 => state.input_target.push(c),
@@ -412,7 +452,7 @@ impl App {
         }
     }
 
-    fn pop_char_from_field(&self, state: &mut AppState) {
+    fn pop_char(state: &mut AppState) {
         match state.active_tab {
             AppTab::Dashboard => match state.active_field {
                 0 => { state.input_target.pop(); }
@@ -428,6 +468,10 @@ impl App {
             _ => {}
         }
     }
+
+    // ─────────────────────────────────────────
+    // Tab navigation
+    // ─────────────────────────────────────────
 
     fn set_tab(&mut self, tab: AppTab) {
         let mut state = self.state.lock().unwrap();
@@ -458,6 +502,10 @@ impl App {
         };
     }
 
+    // ─────────────────────────────────────────
+    // Actions
+    // ─────────────────────────────────────────
+
     async fn handle_enter(&mut self) -> Result<()> {
         let tab = {
             let state = self.state.lock().unwrap();
@@ -477,9 +525,10 @@ impl App {
             let state = self.state.lock().unwrap();
             state.proxy_status.clone()
         };
-
         match status {
-            ProxyStatus::Stopped | ProxyStatus::Error(_) => self.start_proxy().await,
+            ProxyStatus::Stopped | ProxyStatus::Error(_) => {
+                self.start_proxy().await
+            }
             ProxyStatus::Running => self.stop_proxy(),
             _ => Ok(()),
         }
@@ -488,12 +537,11 @@ impl App {
     async fn start_proxy(&mut self) -> Result<()> {
         let (target, sni, port) = {
             let mut state = self.state.lock().unwrap();
-            let target = if state.input_target.is_empty() {
+            if state.input_target.is_empty() {
                 state.add_log(LogLevel::Error, "Target host is required");
                 return Ok(());
-            } else {
-                state.input_target.clone()
-            };
+            }
+            let target = state.input_target.clone();
             let sni = if state.input_sni.is_empty() {
                 target.clone()
             } else {
@@ -504,8 +552,14 @@ impl App {
             state.target_host = target.clone();
             state.sni_host = sni.clone();
             state.proxy_port = port;
-            state.add_log(LogLevel::Info, format!("Starting proxy on port {port}..."));
-            state.add_log(LogLevel::Info, format!("Target: {target} | SNI: {sni}"));
+            state.add_log(
+                LogLevel::Info,
+                format!("Starting proxy on port {}...", port),
+            );
+            state.add_log(
+                LogLevel::Info,
+                format!("Target: {} | SNI: {}", target, sni),
+            );
             (target, sni, port)
         };
 
@@ -514,7 +568,10 @@ impl App {
 
         let handle = tokio::spawn(async move {
             let server = ProxyServer::new(port, target, sni);
-            match server.run_with_stats(state_clone.clone(), event_tx.clone()).await {
+            match server
+                .run_with_stats(state_clone.clone(), event_tx)
+                .await
+            {
                 Ok(_) => {
                     let mut state = state_clone.lock().unwrap();
                     state.proxy_status = ProxyStatus::Stopped;
@@ -522,15 +579,18 @@ impl App {
                 }
                 Err(e) => {
                     let mut state = state_clone.lock().unwrap();
-                    state.proxy_status = ProxyStatus::Error(e.to_string());
-                    state.add_log(LogLevel::Error, format!("Proxy error: {e}"));
+                    state.proxy_status =
+                        ProxyStatus::Error(e.to_string());
+                    state.add_log(
+                        LogLevel::Error,
+                        format!("Proxy error: {}", e),
+                    );
                 }
             }
         });
 
         self.proxy_handle = Some(handle);
 
-        // Brief delay then check startup
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut state = self.state.lock().unwrap();
         if state.proxy_status == ProxyStatus::Starting {
@@ -567,32 +627,46 @@ impl App {
         let (hosts_file, concurrency) = {
             let mut state = self.state.lock().unwrap();
             let hosts_file = state.input_hosts_file.clone();
-            let concurrency = state.input_concurrency.parse::<usize>().unwrap_or(50);
+            let concurrency =
+                state.input_concurrency.parse::<usize>().unwrap_or(50);
             state.scan_status = ScanStatus::Running;
             state.scan_results.clear();
             state.scan_progress = 0.0;
             state.scan_done = 0;
-            state.add_log(LogLevel::Info, format!("Scanning {hosts_file} with concurrency {concurrency}"));
+            state.add_log(
+                LogLevel::Info,
+                format!(
+                    "Scanning {} with concurrency {}",
+                    hosts_file, concurrency
+                ),
+            );
             (hosts_file, concurrency)
         };
 
         let state_clone = Arc::clone(&self.state);
-        let event_tx = self.event_tx.clone();
+
+        // Clone before moving into spawn — fixes E0382
+        let event_tx_closure = self.event_tx.clone();
 
         let handle = tokio::spawn(async move {
             let scanner = SniScanner::new(concurrency);
 
-            // Count total hosts
             let hosts = match tokio::fs::read_to_string(&hosts_file).await {
                 Ok(content) => content
                     .lines()
-                    .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+                    .filter(|l| {
+                        !l.trim().is_empty() && !l.starts_with('#')
+                    })
                     .map(|l| l.trim().to_string())
                     .collect::<Vec<_>>(),
                 Err(e) => {
                     let mut state = state_clone.lock().unwrap();
-                    state.scan_status = ScanStatus::Error(e.to_string());
-                    state.add_log(LogLevel::Error, format!("Cannot read hosts file: {e}"));
+                    state.scan_status =
+                        ScanStatus::Error(e.to_string());
+                    state.add_log(
+                        LogLevel::Error,
+                        format!("Cannot read hosts file: {}", e),
+                    );
                     return;
                 }
             };
@@ -600,31 +674,44 @@ impl App {
             {
                 let mut state = state_clone.lock().unwrap();
                 state.scan_total = hosts.len();
-                state.add_log(LogLevel::Info, format!("Found {} hosts to scan", hosts.len()));
+                state.add_log(
+                    LogLevel::Info,
+                    format!("Found {} hosts to scan", hosts.len()),
+                );
             }
 
-            let _ = event_tx.send(AppEvent::ScanStarted(hosts.len()));
+            let _ = event_tx_closure
+                .send(AppEvent::ScanStarted(hosts.len()));
 
-            let results = scanner.scan_hosts(
-                hosts,
-                move |result| {
-                    let _ = event_tx.send(AppEvent::ScanResult(result));
-                }
-            ).await;
+            // Clone again for the per-result callback
+            let event_tx_cb = event_tx_closure.clone();
+
+            let results = scanner
+                .scan_hosts(hosts, move |result| {
+                    let _ = event_tx_cb
+                        .send(AppEvent::ScanResult(result));
+                })
+                .await;
 
             let mut state = state_clone.lock().unwrap();
-            let working_count = results.iter().filter(|r| r.is_working).count();
+            let working_count =
+                results.iter().filter(|r| r.is_working).count();
             state.scan_status = ScanStatus::Completed;
             state.scan_progress = 1.0;
             state.add_log(
                 LogLevel::Success,
-                format!("Scan complete! {}/{} hosts working", working_count, results.len())
+                format!(
+                    "Scan complete! {}/{} hosts working",
+                    working_count,
+                    results.len()
+                ),
             );
-            let _ = event_tx.send(AppEvent::ScanCompleted);
+
+            let _ = event_tx_closure.send(AppEvent::ScanCompleted);
         });
 
         self.scanner_handle = Some(handle);
-        // Switch to results tab automatically
+
         {
             let mut state = self.state.lock().unwrap();
             state.active_tab = AppTab::Results;
@@ -642,24 +729,32 @@ impl App {
         state.add_log(LogLevel::Warning, "Scan stopped by user");
     }
 
+    // ─────────────────────────────────────────
+    // App event handler
+    // ─────────────────────────────────────────
+
     async fn handle_app_event(&mut self, event: AppEvent) -> Result<()> {
         match event {
             AppEvent::ScanResult(result) => {
                 let mut state = self.state.lock().unwrap();
                 state.scan_done += 1;
                 if state.scan_total > 0 {
-                    state.scan_progress = state.scan_done as f64 / state.scan_total as f64;
+                    state.scan_progress =
+                        state.scan_done as f64 / state.scan_total as f64;
                 }
                 if result.is_working {
                     state.add_log(
                         LogLevel::Success,
-                        format!("✓ {} - {}ms", result.host, result.latency_ms)
+                        format!(
+                            "✓ {} - {}ms",
+                            result.host, result.latency_ms
+                        ),
                     );
                 }
                 state.scan_results.push(result);
-                // Sort: working first, then by latency
                 state.scan_results.sort_by(|a, b| {
-                    b.is_working.cmp(&a.is_working)
+                    b.is_working
+                        .cmp(&a.is_working)
                         .then(a.latency_ms.cmp(&b.latency_ms))
                 });
             }
@@ -685,6 +780,10 @@ impl App {
         Ok(())
     }
 
+    // ─────────────────────────────────────────
+    // Use selected SNI
+    // ─────────────────────────────────────────
+
     fn use_selected_sni(&mut self) {
         let selected = {
             let state = self.state.lock().unwrap();
@@ -698,35 +797,15 @@ impl App {
                 state.active_tab = AppTab::Dashboard;
                 state.add_log(
                     LogLevel::Info,
-                    format!("SNI set to: {}", result.host)
+                    format!("SNI set to: {}", result.host),
                 );
             }
         }
     }
 
-    fn next_field(&mut self) {
-        let mut state = self.state.lock().unwrap();
-        let count = match state.active_tab {
-            AppTab::Dashboard => 3,
-            AppTab::Scanner => 2,
-            _ => 1,
-        };
-        state.active_field = (state.active_field + 1) % count;
-    }
-
-    fn prev_field(&mut self) {
-        let mut state = self.state.lock().unwrap();
-        let count = match state.active_tab {
-            AppTab::Dashboard => 3,
-            AppTab::Scanner => 2,
-            _ => 1usize,
-        };
-        if state.active_field == 0 {
-            state.active_field = count - 1;
-        } else {
-            state.active_field -= 1;
-        }
-    }
+    // ─────────────────────────────────────────
+    // Scroll helpers
+    // ─────────────────────────────────────────
 
     fn scroll_up(&mut self) {
         let mut state = self.state.lock().unwrap();
@@ -770,7 +849,8 @@ impl App {
         let mut state = self.state.lock().unwrap();
         match state.active_tab {
             AppTab::Results => {
-                state.selected_result = state.selected_result.saturating_sub(10);
+                state.selected_result =
+                    state.selected_result.saturating_sub(10);
             }
             AppTab::Logs => {
                 state.auto_scroll_logs = false;
@@ -785,7 +865,8 @@ impl App {
         match state.active_tab {
             AppTab::Results => {
                 let max = state.scan_results.len().saturating_sub(1);
-                state.selected_result = (state.selected_result + 10).min(max);
+                state.selected_result =
+                    (state.selected_result + 10).min(max);
             }
             AppTab::Logs => {
                 let max = state.logs.len().saturating_sub(1);
@@ -811,13 +892,34 @@ impl App {
         let mut state = self.state.lock().unwrap();
         match state.active_tab {
             AppTab::Results => {
-                state.selected_result = state.scan_results.len().saturating_sub(1);
+                state.selected_result =
+                    state.scan_results.len().saturating_sub(1);
             }
             AppTab::Logs => {
                 state.log_scroll = state.logs.len().saturating_sub(1);
                 state.auto_scroll_logs = true;
             }
             _ => {}
+        }
+    }
+
+    // ─────────────────────────────────────────
+    // Field navigation
+    // ─────────────────────────────────────────
+
+    fn next_field(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        let count = Self::field_count_for(&state);
+        state.active_field = (state.active_field + 1) % count;
+    }
+
+    fn prev_field(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        let count = Self::field_count_for(&state);
+        if state.active_field == 0 {
+            state.active_field = count - 1;
+        } else {
+            state.active_field -= 1;
         }
     }
 }
