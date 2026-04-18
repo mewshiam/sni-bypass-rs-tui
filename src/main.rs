@@ -313,10 +313,10 @@ fn setup_logger(log_file: &str, level: &str) {
 // ─────────────────────────────────────────────
 
 /// Full TUI mode
+// ── Fix E0609: was config.port, must be config.proxy.port ──
 async fn run_tui(config: Config, is_termux: bool) -> Result<()> {
-    let mut app = App::new(config.port, is_termux)?;
+    let mut app = App::new(&config, is_termux)?;
 
-    // Pre-fill from config
     if !config.proxy.target_host.is_empty() {
         app.set_target(config.proxy.target_host.clone());
     }
