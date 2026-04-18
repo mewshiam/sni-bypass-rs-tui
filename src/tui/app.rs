@@ -637,9 +637,9 @@ impl App {
         if event::poll(tick)? {
             match event::read()? {
                 Event::Key(key)
-                    // Only handle Press — ignore Release and Repeat
-                    // to prevent double input on crossterm 0.27+
-                    if key.kind == KeyEventKind::Press =>
+                    // Ignore key-release events, but accept press/repeat.
+                    // Some terminals send navigation keys as Repeat.
+                    if key.kind != KeyEventKind::Release =>
                 {
                     if !self.handle_key(key).await? {
                         return Ok(());
@@ -685,6 +685,7 @@ impl App {
 
     async fn key_normal(&mut self, key: KeyEvent) -> Result<bool> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let active_tab = self.state.lock().unwrap().active_tab.clone();
 
         match key.code {
             // Quit
@@ -720,7 +721,19 @@ impl App {
             }
 
             // Proxy / scan
-            KeyCode::Char('s') => self.toggle_proxy().await?,
+            KeyCode::Char('s') => {
+                if active_tab == AppTab::Scanner {
+                    if self.state.lock().unwrap().scan_status
+                        == ScanStatus::Running
+                    {
+                        self.stop_scan();
+                    } else {
+                        self.start_scan().await?;
+                    }
+                } else {
+                    self.toggle_proxy().await?;
+                }
+            }
             KeyCode::Char('S') => self.start_scan().await?,
             KeyCode::Char('x') => self.stop_scan(),
             KeyCode::Enter => self.ctx_enter().await?,

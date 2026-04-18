@@ -461,7 +461,7 @@ Full keybinding reference built into the TUI. Press `5` or `?` to access.
 
 | Key | Action |
 |-----|--------|
-| `S` | Start scan |
+| `s` / `S` | Start scan (or stop if already scanning) |
 | `x` | Stop scan |
 
 ### Results
