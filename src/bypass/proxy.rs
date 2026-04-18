@@ -188,18 +188,15 @@ async fn handle_connection(
 async fn handle_tls_tunnel(
     mut client: TcpStream,
     target: &str,
-    sni: &str,
+    _sni: &str,
     fragment_enabled: bool,
     frag_split: usize,
     frag_delay_ms: u64,
 ) -> Result<u64> {
-    use rustls::{ClientConfig, RootCertStore};
-    use std::sync::Arc as StdArc;
-    use tokio_rustls::TlsConnector;
-
     let addr = format!("{}:443", target);
     let mut upstream = TcpStream::connect(&addr).await?;
     upstream.set_nodelay(true)?;
+    client.set_nodelay(true)?;
 
     if fragment_enabled {
         let mut first = vec![0u8; 16 * 1024];
@@ -214,56 +211,21 @@ async fn handle_tls_tunnel(
         tokio::time::sleep(Duration::from_millis(frag_delay_ms)).await;
         upstream.write_all(&first[split_at..n]).await?;
 
-        let mut bytes = n as u64;
-        let (from_client, from_server) =
-            tokio::io::copy_bidirectional(&mut client, &mut upstream)
-                .await?;
-        bytes += from_client + from_server;
-        return Ok(bytes);
+        return relay_bidirectional(client, upstream, n as u64).await;
     }
 
-    let mut root_store = RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    relay_bidirectional(client, upstream, 0).await
+}
 
-    let config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    let connector = TlsConnector::from(StdArc::new(config));
-    let server_name =
-        rustls::pki_types::ServerName::try_from(sni.to_string())?;
-
-    let mut tls_upstream = connector.connect(server_name, upstream).await?;
-
-    // Two separate buffers — one per direction — fixes E0499
-    let mut client_buf = vec![0u8; 8192];
-    let mut upstream_buf = vec![0u8; 8192];
-    let mut bytes: u64 = 0;
-
-    loop {
-        tokio::select! {
-            result = client.read(&mut client_buf) => {
-                match result {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        tls_upstream.write_all(&client_buf[..n]).await?;
-                        bytes += n as u64;
-                    }
-                }
-            }
-            result = tls_upstream.read(&mut upstream_buf) => {
-                match result {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        client.write_all(&upstream_buf[..n]).await?;
-                        bytes += n as u64;
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(bytes)
+async fn relay_bidirectional(
+    mut client: TcpStream,
+    mut upstream: TcpStream,
+    initial_bytes: u64,
+) -> Result<u64> {
+    let (from_client, from_server) =
+        tokio::io::copy_bidirectional(&mut client, &mut upstream)
+            .await?;
+    Ok(initial_bytes + from_client + from_server)
 }
 
 // ─────────────────────────────────────────────
