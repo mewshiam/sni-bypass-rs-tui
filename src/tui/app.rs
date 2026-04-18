@@ -607,7 +607,7 @@ impl App {
 
             let results = scanner.scan_hosts(
                 hosts,
-                |result| {
+                move |result| {
                     let _ = event_tx.send(AppEvent::ScanResult(result));
                 }
             ).await;
