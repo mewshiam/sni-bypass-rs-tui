@@ -32,7 +32,17 @@ pub struct ProxyConfig {
     pub timeout_secs: u64,
     pub buffer_size: usize,
     pub max_connections: usize,
+    #[serde(default = "default_fragment_enabled")]
+    pub fragment_enabled: bool,
+    #[serde(default = "default_frag_split")]
+    pub frag_split: usize,
+    #[serde(default = "default_frag_delay_ms")]
+    pub frag_delay_ms: u64,
 }
+
+fn default_fragment_enabled() -> bool { true }
+fn default_frag_split() -> usize { 1 }
+fn default_frag_delay_ms() -> u64 { 1 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ScannerConfig {
@@ -76,6 +86,9 @@ impl Default for Config {
                 timeout_secs: 30,
                 buffer_size: 8192,
                 max_connections: 100,
+                fragment_enabled: default_fragment_enabled(),
+                frag_split: default_frag_split(),
+                frag_delay_ms: default_frag_delay_ms(),
             },
             scanner: ScannerConfig {
                 hosts_file: "hosts.txt".to_string(),
@@ -367,7 +380,14 @@ async fn run_headless(config: &Config) -> Result<()> {
     println!("[*] Starting proxy... (Ctrl+C to stop)");
     println!("[*] Set your proxy to 127.0.0.1:{}", port);
 
-    let server = ProxyServer::new(port, target, sni);
+    let server = ProxyServer::new(
+        port,
+        target,
+        sni,
+        config.proxy.fragment_enabled,
+        config.proxy.frag_split,
+        config.proxy.frag_delay_ms,
+    );
     server.run().await
 }
 
