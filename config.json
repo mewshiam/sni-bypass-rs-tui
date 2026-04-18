@@ -1,9 +1,12 @@
 {
   "listeners": [
     {
-      "listen": "0.0.0.0:40443",
-      "connect": "172.67.139.236:443",
-      "fake_sni": "security.vercel.com"
+      "listen":        "127.0.0.1:1080",
+      "connect":       "1.2.3.4:443",
+      "fake_sni":      "www.google.com",
+      "mode":          "dual",
+      "frag_split":    1,
+      "frag_delay_ms": 1
     }
   ]
 }
