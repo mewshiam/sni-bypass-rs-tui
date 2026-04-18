@@ -1,14 +1,16 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use socket2::{SockRef, TcpKeepalive};
+use socket2::SockRef;
+use socket2::TcpKeepalive;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::config::BypassMode;
 use crate::error::HandlerError;
 use crate::packet::tls;
-use crate::proto::{ConnId, Deregistration, Registration, SnifferCommand, SnifferResult};
+use crate::proto::{ConnId, Deregistration, FragmentConfig, Registration, SnifferCommand, SnifferResult};
 use crate::relay;
 
 pub async fn handle_connection(
@@ -17,8 +19,14 @@ pub async fn handle_connection(
     fake_sni: String,
     local_ip: std::net::IpAddr,
     cmd_tx: std::sync::mpsc::Sender<SnifferCommand>,
+    mode: BypassMode,
+    frag_split: usize,
+    frag_delay_ms: u64,
 ) {
-    if let Err(e) = handle_inner(client, upstream_addr, &fake_sni, local_ip, &cmd_tx).await {
+    if let Err(e) = handle_inner(
+        client, upstream_addr, &fake_sni, local_ip, &cmd_tx,
+        mode, frag_split, frag_delay_ms,
+    ).await {
         match &e {
             HandlerError::Timeout => {
                 warn!(upstream = %upstream_addr, "timeout waiting for fake ACK");
@@ -36,9 +44,15 @@ async fn handle_inner(
     fake_sni: &str,
     local_ip: std::net::IpAddr,
     cmd_tx: &std::sync::mpsc::Sender<SnifferCommand>,
+    mode: BypassMode,
+    frag_split: usize,
+    frag_delay_ms: u64,
 ) -> Result<(), HandlerError> {
+    // Build the fake ClientHello payload (used in FakeSni and Dual modes).
+    // In Fragment-only mode this is still built but the sniffer won't inject it.
     let fake_payload = tls::build_client_hello(fake_sni);
 
+    // ── Open upstream socket ─────────────────────────────────────────────────
     let upstream_sock = if upstream_addr.is_ipv4() {
         socket2::Socket::new(
             socket2::Domain::IPV4,
@@ -55,6 +69,10 @@ async fn handle_inner(
     .map_err(HandlerError::Connect)?;
 
     upstream_sock.set_nonblocking(true).map_err(HandlerError::Connect)?;
+
+    // TCP_NODELAY is essential for fragmentation: without it the OS may
+    // merge our two fragment writes into a single TCP segment.
+    upstream_sock.set_nodelay(true).map_err(HandlerError::Connect)?;
 
     let bind_addr: SocketAddr = if upstream_addr.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
@@ -83,11 +101,17 @@ async fn handle_inner(
         dst_port: upstream_addr.port(),
     };
 
+    // ── Register with sniffer ────────────────────────────────────────────────
     let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
     cmd_tx
         .send(SnifferCommand::Register(Registration {
             conn_id,
             fake_payload,
+            frag_cfg: FragmentConfig {
+                split_at: frag_split,
+                delay_ms: frag_delay_ms,
+                mode: mode.clone(),
+            },
             result_tx,
             registered_tx,
         }))
@@ -95,6 +119,7 @@ async fn handle_inner(
 
     let _ = registered_rx.await;
 
+    // ── TCP connect ──────────────────────────────────────────────────────────
     match upstream_sock.connect(&upstream_addr.into()) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -131,21 +156,25 @@ async fn handle_inner(
         }
     }
 
+    // ── Keepalive ────────────────────────────────────────────────────────────
     let keepalive = TcpKeepalive::new()
         .with_time(Duration::from_secs(11))
         .with_interval(Duration::from_secs(2));
-    let sock_ref = SockRef::from(&upstream);
-    let _ = sock_ref.set_tcp_keepalive(&keepalive);
+    let _ = SockRef::from(&upstream).set_tcp_keepalive(&keepalive);
+    let _ = SockRef::from(&client).set_tcp_keepalive(&keepalive);
 
-    let client_ref = SockRef::from(&client);
-    let _ = client_ref.set_tcp_keepalive(&keepalive);
-
-    debug!(port = local_addr.port(), "connected, waiting for sniffer confirmation");
+    // ── Wait for sniffer confirmation (FakeSni / Dual modes) ─────────────────
+    //
+    // In Fragment-only mode the sniffer sends ReadyImmediate right away
+    // (no fake injection needed), so the timeout here is effectively instant.
+    // In FakeSni / Dual modes we wait for the server's ACK to confirm the
+    // fake ClientHello was dropped as expected.
+    debug!(port = local_addr.port(), "waiting for sniffer confirmation");
 
     let confirmed = tokio::time::timeout(Duration::from_secs(2), async {
         while let Some(result) = result_rx.recv().await {
             match result {
-                SnifferResult::FakeConfirmed => return Ok(()),
+                SnifferResult::FakeConfirmed | SnifferResult::ReadyImmediate => return Ok(()),
                 SnifferResult::Failed(e) => return Err(HandlerError::SnifferFailed(e)),
             }
         }
@@ -159,7 +188,21 @@ async fn handle_inner(
         Err(_) => return Err(HandlerError::Timeout),
     }
 
-    info!(port = local_addr.port(), "fake confirmed, starting relay");
+    info!(port = local_addr.port(), mode = ?mode, "bypass confirmed, starting relay");
 
-    relay::relay(client, upstream).await.map_err(HandlerError::Relay)
+    // ── Relay ────────────────────────────────────────────────────────────────
+    match mode {
+        BypassMode::FakeSni => {
+            // Original behaviour: relay normally, DPI already whitelisted the flow.
+            relay::relay(client, upstream)
+                .await
+                .map_err(HandlerError::Relay)
+        }
+        BypassMode::Fragment | BypassMode::Dual => {
+            // Fragment the first upstream write (the real TLS ClientHello).
+            relay::relay_with_fragment(client, upstream, frag_split, frag_delay_ms)
+                .await
+                .map_err(HandlerError::Relay)
+        }
+    }
 }

@@ -14,7 +14,15 @@ pub async fn run_listener(
 ) {
     let listener = match TcpListener::bind(lc.listen).await {
         Ok(l) => {
-            info!(listen = %lc.listen, upstream = %lc.connect, sni = %lc.fake_sni, "listener started");
+            info!(
+                listen   = %lc.listen,
+                upstream = %lc.connect,
+                sni      = %lc.fake_sni,
+                mode     = ?lc.mode,
+                frag_split    = lc.frag_split,
+                frag_delay_ms = lc.frag_delay_ms,
+                "listener started"
+            );
             l
         }
         Err(e) => {
@@ -26,13 +34,19 @@ pub async fn run_listener(
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
-                let upstream = lc.connect;
-                let sni = lc.fake_sni.clone();
-                let tx = cmd_tx.clone();
+                let upstream      = lc.connect;
+                let sni           = lc.fake_sni.clone();
+                let mode          = lc.mode.clone();
+                let frag_split    = lc.frag_split;
+                let frag_delay_ms = lc.frag_delay_ms;
+                let tx  = cmd_tx.clone();
                 let lip = local_ip;
                 tokio::spawn(async move {
                     tracing::debug!(peer = %peer, "accepted connection");
-                    handler::handle_connection(stream, upstream, sni, lip, tx).await;
+                    handler::handle_connection(
+                        stream, upstream, sni, lip, tx,
+                        mode, frag_split, frag_delay_ms,
+                    ).await;
                 });
             }
             Err(e) => {

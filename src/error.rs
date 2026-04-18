@@ -10,6 +10,8 @@ pub enum ConfigError {
     Empty,
     #[error("fake_sni too long (max 219 bytes): '{0}'")]
     SniTooLong(String),
+    #[error("frag_split must be >= 1")]
+    BadFragSplit,
 }
 
 #[derive(Debug, Error)]
