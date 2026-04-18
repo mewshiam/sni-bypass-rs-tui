@@ -1,12 +1,36 @@
 {
-  "listeners": [
-    {
-      "listen":        "127.0.0.1:1080",
-      "connect":       "1.2.3.4:443",
-      "fake_sni":      "www.google.com",
-      "mode":          "dual",
-      "frag_split":    1,
-      "frag_delay_ms": 1
-    }
-  ]
+  "version": "0.2.0",
+
+  "proxy": {
+    "host": "127.0.0.1",
+    "port": 8080,
+    "target_host": "",
+    "sni_host": "",
+    "timeout_secs": 30,
+    "buffer_size": 8192,
+    "max_connections": 100
+  },
+
+  "scanner": {
+    "hosts_file": "hosts.txt",
+    "concurrency": 50,
+    "timeout_secs": 5,
+    "ports": [443, 80, 8080],
+    "check_tls": true,
+    "check_http": true,
+    "save_results": true,
+    "results_file": "scan_results.json"
+  },
+
+  "tui": {
+    "auto_scroll_logs": true,
+    "max_log_entries": 500,
+    "refresh_ms": 50,
+    "show_help_on_start": false
+  },
+
+  "log": {
+    "file": "sni-bypass.log",
+    "level": "info"
+  }
 }
