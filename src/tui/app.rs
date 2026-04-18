@@ -524,6 +524,9 @@ pub struct App {
     event_rx: mpsc::UnboundedReceiver<AppEvent>,
     proxy_handle: Option<tokio::task::JoinHandle<()>>,
     scanner_handle: Option<tokio::task::JoinHandle<()>>,
+    fragment_enabled: bool,
+    frag_split: usize,
+    frag_delay_ms: u64,
 }
 
 impl App {
@@ -537,6 +540,9 @@ impl App {
             event_rx,
             proxy_handle: None,
             scanner_handle: None,
+            fragment_enabled: config.proxy.fragment_enabled,
+            frag_split: config.proxy.frag_split,
+            frag_delay_ms: config.proxy.frag_delay_ms,
         })
     }
 
@@ -614,7 +620,7 @@ impl App {
 
     // ── Main loop ─────────────────────────────
 
-    sync fn main_loop<B: ratatui::backend::Backend>(
+    async fn main_loop<B: ratatui::backend::Backend>(
     &mut self,
     terminal: &mut Terminal<B>,
 ) -> Result<()> {
@@ -1143,9 +1149,19 @@ impl App {
 
         let state_clone = Arc::clone(&self.state);
         let event_tx = self.event_tx.clone();
+        let fragment_enabled = self.fragment_enabled;
+        let frag_split = self.frag_split;
+        let frag_delay_ms = self.frag_delay_ms;
 
         let handle = tokio::spawn(async move {
-            let server = ProxyServer::new(port, target, sni);
+            let server = ProxyServer::new(
+                port,
+                target,
+                sni,
+                fragment_enabled,
+                frag_split,
+                frag_delay_ms,
+            );
             match server
                 .run_with_stats(state_clone.clone(), event_tx)
                 .await
