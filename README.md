@@ -261,7 +261,10 @@ For scripting or running without a terminal:
 ./sni-bypass-rs-tui --headless \
   --target speedtest.net \
   --sni cdn.cloudflare.net \
-  --port 8080
+  --port 8080 \
+  --fragment \
+  --frag-split 1 \
+  --frag-delay-ms 3
 
 # Run scanner only (outputs to stdout)
 ./sni-bypass-rs-tui --scan-only \
@@ -284,9 +287,33 @@ OPTIONS:
     -c, --concurrency <NUM>      Scanner concurrency [default: 50]
     -H, --headless               Run without TUI
         --scan-only              Run scanner only then exit
+        --fragment               Force-enable CONNECT payload fragmentation
+        --no-fragment            Force-disable CONNECT payload fragmentation
+        --frag-split <BYTES>     Split point for first CONNECT payload
+        --frag-delay-ms <MS>     Delay between first and second fragment
+        --config <FILE>          Config file path [default: config.json]
+        --print-config           Print current config and exit
     -h, --help                   Print help
     -V, --version                Print version
 ```
+
+### Fragment mode (new)
+
+The proxy now supports **first-payload fragmentation** for CONNECT/TLS tunnels.
+When enabled, the first client payload is split and sent in two writes with a
+small delay. This is useful in environments where TCP/TLS segmentation behavior
+impacts SNI filtering.
+
+Defaults:
+
+- `fragment_enabled = false`
+- `frag_split = 1`
+- `frag_delay_ms = 1`
+
+You can tune these from:
+
+- `config.json` (`proxy.fragment_enabled`, `proxy.frag_split`, `proxy.frag_delay_ms`)
+- CLI flags (`--fragment`, `--no-fragment`, `--frag-split`, `--frag-delay-ms`)
 
 ---
 
@@ -434,7 +461,7 @@ Full keybinding reference built into the TUI. Press `5` or `?` to access.
 
 | Key | Action |
 |-----|--------|
-| `S` | Start scan |
+| `s` / `S` | Start scan (or stop if already scanning) |
 | `x` | Stop scan |
 
 ### Results

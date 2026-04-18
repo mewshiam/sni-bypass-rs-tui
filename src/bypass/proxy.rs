@@ -13,14 +13,27 @@ pub struct ProxyServer {
     port: u16,
     target_host: String,
     sni_host: String,
+    fragment_enabled: bool,
+    frag_split: usize,
+    frag_delay_ms: u64,
 }
 
 impl ProxyServer {
-    pub fn new(port: u16, target_host: String, sni_host: String) -> Self {
+    pub fn new(
+        port: u16,
+        target_host: String,
+        sni_host: String,
+        fragment_enabled: bool,
+        frag_split: usize,
+        frag_delay_ms: u64,
+    ) -> Self {
         Self {
             port,
             target_host,
             sni_host,
+            fragment_enabled,
+            frag_split,
+            frag_delay_ms,
         }
     }
 
@@ -30,6 +43,9 @@ impl ProxyServer {
         let listener = TcpListener::bind(&addr).await?;
         let target = Arc::new(self.target_host);
         let sni = Arc::new(self.sni_host);
+        let fragment_enabled = self.fragment_enabled;
+        let frag_split = self.frag_split;
+        let frag_delay_ms = self.frag_delay_ms;
 
         tracing::info!("Proxy listening on {}", addr);
 
@@ -40,7 +56,15 @@ impl ProxyServer {
 
             tokio::spawn(async move {
                 if let Err(e) =
-                    handle_connection(client, &target, &sni).await
+                    handle_connection(
+                        client,
+                        &target,
+                        &sni,
+                        fragment_enabled,
+                        frag_split,
+                        frag_delay_ms,
+                    )
+                    .await
                 {
                     tracing::error!(
                         "Connection error from {}: {}",
@@ -61,6 +85,9 @@ impl ProxyServer {
         let listener = TcpListener::bind(&addr).await?;
         let target = Arc::new(self.target_host);
         let sni = Arc::new(self.sni_host);
+        let fragment_enabled = self.fragment_enabled;
+        let frag_split = self.frag_split;
+        let frag_delay_ms = self.frag_delay_ms;
         let active_conns = Arc::new(AtomicU64::new(0));
 
         tracing::info!("Proxy (with stats) listening on {}", addr);
@@ -80,7 +107,15 @@ impl ProxyServer {
                 });
 
                 let bytes =
-                    match handle_connection(client, &target, &sni).await {
+                    match handle_connection(
+                        client,
+                        &target,
+                        &sni,
+                        fragment_enabled,
+                        frag_split,
+                        frag_delay_ms,
+                    )
+                    .await {
                         Ok(b) => b,
                         Err(e) => {
                             tracing::error!(
@@ -109,6 +144,9 @@ async fn handle_connection(
     mut client: TcpStream,
     target: &str,
     sni: &str,
+    fragment_enabled: bool,
+    frag_split: usize,
+    frag_delay_ms: u64,
 ) -> Result<u64> {
     let mut buf = vec![0u8; 4096];
     let n = timeout(
@@ -128,7 +166,15 @@ async fn handle_connection(
         client
             .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
             .await?;
-        handle_tls_tunnel(client, target, sni).await
+        handle_tls_tunnel(
+            client,
+            target,
+            sni,
+            fragment_enabled,
+            frag_split,
+            frag_delay_ms,
+        )
+        .await
     } else {
         // Plain HTTP
         handle_http_proxy(client, target, &buf[..n]).await
@@ -143,13 +189,54 @@ async fn handle_tls_tunnel(
     mut client: TcpStream,
     target: &str,
     sni: &str,
+    fragment_enabled: bool,
+    frag_split: usize,
+    frag_delay_ms: u64,
 ) -> Result<u64> {
     use rustls::{ClientConfig, RootCertStore};
     use std::sync::Arc as StdArc;
     use tokio_rustls::TlsConnector;
 
     let addr = format!("{}:443", target);
-    let upstream = TcpStream::connect(&addr).await?;
+    let mut upstream = TcpStream::connect(&addr).await?;
+    upstream.set_nodelay(true)?;
+
+    if fragment_enabled {
+        let mut first = vec![0u8; 16 * 1024];
+        let n = timeout(Duration::from_secs(10), client.read(&mut first))
+            .await??;
+        if n == 0 {
+            return Ok(0);
+        }
+        if n < 2 {
+            upstream.write_all(&first[..n]).await?;
+            let mut bytes = n as u64;
+            let (from_client, from_server) =
+                tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                    .await?;
+            bytes += from_client + from_server;
+            return Ok(bytes);
+        }
+
+        let split_at =
+            frag_split.clamp(1, n.saturating_sub(1).max(1));
+        tracing::debug!(
+            split_at,
+            frag_delay_ms,
+            first_payload = n,
+            "fragmenting first CONNECT payload"
+        );
+        upstream.write_all(&first[..split_at]).await?;
+        tokio::time::sleep(Duration::from_millis(frag_delay_ms)).await;
+        upstream.write_all(&first[split_at..n]).await?;
+
+        let mut bytes = n as u64;
+        let (from_client, from_server) =
+            tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                .await?;
+        bytes += from_client + from_server;
+        return Ok(bytes);
+    }
 
     let mut root_store = RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());

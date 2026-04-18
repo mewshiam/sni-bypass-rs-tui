@@ -524,6 +524,9 @@ pub struct App {
     event_rx: mpsc::UnboundedReceiver<AppEvent>,
     proxy_handle: Option<tokio::task::JoinHandle<()>>,
     scanner_handle: Option<tokio::task::JoinHandle<()>>,
+    fragment_enabled: bool,
+    frag_split: usize,
+    frag_delay_ms: u64,
 }
 
 impl App {
@@ -537,6 +540,9 @@ impl App {
             event_rx,
             proxy_handle: None,
             scanner_handle: None,
+            fragment_enabled: config.proxy.fragment_enabled,
+            frag_split: config.proxy.frag_split,
+            frag_delay_ms: config.proxy.frag_delay_ms,
         })
     }
 
@@ -614,7 +620,7 @@ impl App {
 
     // ── Main loop ─────────────────────────────
 
-    sync fn main_loop<B: ratatui::backend::Backend>(
+    async fn main_loop<B: ratatui::backend::Backend>(
     &mut self,
     terminal: &mut Terminal<B>,
 ) -> Result<()> {
@@ -631,9 +637,9 @@ impl App {
         if event::poll(tick)? {
             match event::read()? {
                 Event::Key(key)
-                    // Only handle Press — ignore Release and Repeat
-                    // to prevent double input on crossterm 0.27+
-                    if key.kind == KeyEventKind::Press =>
+                    // Ignore key-release events, but accept press/repeat.
+                    // Some terminals send navigation keys as Repeat.
+                    if key.kind != KeyEventKind::Release =>
                 {
                     if !self.handle_key(key).await? {
                         return Ok(());
@@ -679,6 +685,7 @@ impl App {
 
     async fn key_normal(&mut self, key: KeyEvent) -> Result<bool> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let active_tab = self.state.lock().unwrap().active_tab.clone();
 
         match key.code {
             // Quit
@@ -714,7 +721,19 @@ impl App {
             }
 
             // Proxy / scan
-            KeyCode::Char('s') => self.toggle_proxy().await?,
+            KeyCode::Char('s') => {
+                if active_tab == AppTab::Scanner {
+                    if self.state.lock().unwrap().scan_status
+                        == ScanStatus::Running
+                    {
+                        self.stop_scan();
+                    } else {
+                        self.start_scan().await?;
+                    }
+                } else {
+                    self.toggle_proxy().await?;
+                }
+            }
             KeyCode::Char('S') => self.start_scan().await?,
             KeyCode::Char('x') => self.stop_scan(),
             KeyCode::Enter => self.ctx_enter().await?,
@@ -1143,9 +1162,19 @@ impl App {
 
         let state_clone = Arc::clone(&self.state);
         let event_tx = self.event_tx.clone();
+        let fragment_enabled = self.fragment_enabled;
+        let frag_split = self.frag_split;
+        let frag_delay_ms = self.frag_delay_ms;
 
         let handle = tokio::spawn(async move {
-            let server = ProxyServer::new(port, target, sni);
+            let server = ProxyServer::new(
+                port,
+                target,
+                sni,
+                fragment_enabled,
+                frag_split,
+                frag_delay_ms,
+            );
             match server
                 .run_with_stats(state_clone.clone(), event_tx)
                 .await
