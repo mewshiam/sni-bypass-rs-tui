@@ -102,7 +102,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-
 
@@ -159,11 +159,11 @@ jobs:
       # ── Build ──
       - name: Build (native)
         if: matrix.cross == false
-        run: cargo build --release --target ${{ matrix.target }} --locked
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Build (cross)
         if: matrix.cross == true && matrix.is_android != true
-        run: cross build --release --target ${{ matrix.target }} --locked
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Build (Android/cross)
         if: matrix.is_android == true
@@ -172,7 +172,7 @@ jobs:
           CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER: armv7a-linux-androideabi33-clang
           # Use rustls features only (no OpenSSL for Android)
           RUSTFLAGS: "-C target-feature=+crt-static"
-        run: cross build --release --target ${{ matrix.target }} --locked
+        run: cross build --release --target ${{ matrix.target }}
 
       # ── Strip binary (reduce size) ──
       - name: Strip binary (Linux/macOS)
