@@ -1154,15 +1154,17 @@ impl App {
 
         self.proxy_handle = Some(handle);
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let mut s = self.state.lock().unwrap();
-        if s.proxy_status == ProxyStatus::Starting {
-            s.proxy_status = ProxyStatus::Running;
-            s.add_log(
-                LogLevel::Success,
-                format!("Proxy running on 127.0.0.1:{}", s.proxy_port),
-            );
-        }
+        // AFTER — read proxy_port first, then borrow mutably
+tokio::time::sleep(Duration::from_millis(150)).await;
+let mut s = self.state.lock().unwrap();
+if s.proxy_status == ProxyStatus::Starting {
+    s.proxy_status = ProxyStatus::Running;
+    let port = s.proxy_port; // read BEFORE mutable borrow via add_log
+    s.add_log(
+        LogLevel::Success,
+        format!("Proxy running on 127.0.0.1:{}", port),
+    );
+}
         Ok(())
     }
 
