@@ -1,11 +1,10 @@
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
         Block, BorderType, Borders, Cell, Clear, Gauge, List, ListItem,
-        Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation,
-        ScrollbarState, Table, Tabs, Wrap,
+        Padding, Paragraph, Row, Table, Tabs, Wrap,
     },
     Frame,
 };
@@ -23,21 +22,19 @@ const COLOR_BG: Color = Color::Black;
 const COLOR_BORDER: Color = Color::Blue;
 
 pub fn render(f: &mut Frame, state: &AppState) {
-    let size = f.size();
+    let size = f.area();
 
-    // Background
     f.render_widget(
         Block::default().style(Style::default().bg(COLOR_BG)),
         size,
     );
 
-    // Main layout
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Header + Tabs
-            Constraint::Min(0),     // Content
-            Constraint::Length(2),  // Status bar
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(2),
         ])
         .split(size);
 
@@ -45,7 +42,6 @@ pub fn render(f: &mut Frame, state: &AppState) {
     render_content(f, state, chunks[1]);
     render_statusbar(f, state, chunks[2]);
 
-    // Popups (rendered on top)
     if state.show_help_popup {
         render_help_popup(f, size);
     }
@@ -57,7 +53,6 @@ fn render_header(f: &mut Frame, state: &AppState, area: Rect) {
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(area);
 
-    // Logo / Title
     let title = Paragraph::new(Line::from(vec![
         Span::styled(" ◈ ", Style::default().fg(COLOR_PRIMARY)),
         Span::styled(
@@ -77,7 +72,6 @@ fn render_header(f: &mut Frame, state: &AppState, area: Rect) {
     );
     f.render_widget(title, chunks[0]);
 
-    // Tabs
     let tab_titles = vec![
         " 1:Dashboard ",
         " 2:Scanner ",
@@ -132,25 +126,17 @@ fn render_dashboard(f: &mut Frame, state: &AppState, area: Rect) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
-    // Left: Config panel
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(9),  // Config inputs
-            Constraint::Min(0),     // Stats
-        ])
+        .constraints([Constraint::Length(9), Constraint::Min(0)])
         .split(chunks[0]);
 
     render_proxy_config(f, state, left_chunks[0]);
     render_stats(f, state, left_chunks[1]);
 
-    // Right: Status + Termux info
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(7),  // Proxy status
-            Constraint::Min(0),     // Quick actions
-        ])
+        .constraints([Constraint::Length(7), Constraint::Min(0)])
         .split(chunks[1]);
 
     render_proxy_status(f, state, right_chunks[0]);
@@ -160,7 +146,7 @@ fn render_dashboard(f: &mut Frame, state: &AppState, area: Rect) {
 fn render_proxy_config(f: &mut Frame, state: &AppState, area: Rect) {
     let is_editing = state.input_mode == InputMode::Editing;
 
-    let fields = [
+    let fields: [(&str, &str, usize); 3] = [
         ("Target Host", &state.input_target, 0),
         ("SNI Host   ", &state.input_sni, 1),
         ("Port       ", &state.input_port, 2),
@@ -189,7 +175,7 @@ fn render_proxy_config(f: &mut Frame, state: &AppState, area: Rect) {
         };
 
         let display_value = if value.is_empty() {
-            format!("  {} <empty>", prefix)
+            format!("  {}<empty>", prefix)
         } else if is_active && is_editing {
             format!("  {}{}█", prefix, value)
         } else {
@@ -204,19 +190,19 @@ fn render_proxy_config(f: &mut Frame, state: &AppState, area: Rect) {
 
     let border_color = if is_editing { COLOR_PRIMARY } else { COLOR_BORDER };
 
-    let block = Block::default()
-        .title(Span::styled(
-            " ⚙ Proxy Configuration ",
-            Style::default()
-                .fg(COLOR_PRIMARY)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color));
-
     let para = Paragraph::new(Text::from(lines))
-        .block(block)
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    " ⚙ Proxy Configuration ",
+                    Style::default()
+                        .fg(COLOR_PRIMARY)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(border_color)),
+        )
         .wrap(Wrap { trim: true });
 
     f.render_widget(para, area);
@@ -227,7 +213,7 @@ fn render_proxy_status(f: &mut Frame, state: &AppState, area: Rect) {
         ProxyStatus::Stopped => ("STOPPED", COLOR_DIM, "⏹"),
         ProxyStatus::Starting => ("STARTING...", COLOR_WARNING, "⏳"),
         ProxyStatus::Running => ("RUNNING", COLOR_SUCCESS, "▶"),
-        ProxyStatus::Error(e) => ("ERROR", COLOR_ERROR, "✗"),
+        ProxyStatus::Error(_) => ("ERROR", COLOR_ERROR, "✗"),
     };
 
     let error_msg = if let ProxyStatus::Error(e) = &state.proxy_status {
@@ -257,14 +243,22 @@ fn render_proxy_status(f: &mut Frame, state: &AppState, area: Rect) {
         Line::from(vec![
             Span::styled("  Target: ", Style::default().fg(COLOR_DIM)),
             Span::styled(
-                if state.target_host.is_empty() { "<not set>".to_string() } else { state.target_host.clone() },
+                if state.target_host.is_empty() {
+                    "<not set>".to_string()
+                } else {
+                    state.target_host.clone()
+                },
                 Style::default().fg(Color::White),
             ),
         ]),
         Line::from(vec![
             Span::styled("  SNI:    ", Style::default().fg(COLOR_DIM)),
             Span::styled(
-                if state.sni_host.is_empty() { "<not set>".to_string() } else { state.sni_host.clone() },
+                if state.sni_host.is_empty() {
+                    "<not set>".to_string()
+                } else {
+                    state.sni_host.clone()
+                },
                 Style::default().fg(COLOR_HIGHLIGHT),
             ),
         ]),
@@ -287,7 +281,9 @@ fn render_proxy_status(f: &mut Frame, state: &AppState, area: Rect) {
             Block::default()
                 .title(Span::styled(
                     " ◈ Proxy Status ",
-                    Style::default().fg(COLOR_PRIMARY).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(COLOR_PRIMARY)
+                        .add_modifier(Modifier::BOLD),
                 ))
                 .title_bottom(Span::styled(
                     format!(" {} ", action),
@@ -339,7 +335,9 @@ fn render_stats(f: &mut Frame, state: &AppState, area: Rect) {
             Block::default()
                 .title(Span::styled(
                     " ◈ Statistics ",
-                    Style::default().fg(COLOR_PRIMARY).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(COLOR_PRIMARY)
+                        .add_modifier(Modifier::BOLD),
                 ))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -352,6 +350,7 @@ fn render_stats(f: &mut Frame, state: &AppState, area: Rect) {
 
 fn render_quick_actions(f: &mut Frame, state: &AppState, area: Rect) {
     let is_termux = state.is_termux;
+
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![
@@ -390,15 +389,15 @@ fn render_quick_actions(f: &mut Frame, state: &AppState, area: Rect) {
             Span::styled("  📱 ", Style::default()),
             Span::styled(
                 "Termux mode active",
-                Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(COLOR_WARNING)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
-        lines.push(Line::from(vec![
-            Span::styled(
-                "  Use hardware keyboard for best experience",
-                Style::default().fg(COLOR_DIM),
-            ),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            "  Use hardware keyboard for best experience",
+            Style::default().fg(COLOR_DIM),
+        )]));
     }
 
     let para = Paragraph::new(Text::from(lines))
@@ -406,7 +405,9 @@ fn render_quick_actions(f: &mut Frame, state: &AppState, area: Rect) {
             Block::default()
                 .title(Span::styled(
                     " ◈ Quick Reference ",
-                    Style::default().fg(COLOR_PRIMARY).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(COLOR_PRIMARY)
+                        .add_modifier(Modifier::BOLD),
                 ))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -421,17 +422,16 @@ fn render_scanner(f: &mut Frame, state: &AppState, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(8),  // Config
-            Constraint::Length(5),  // Progress
-            Constraint::Min(0),     // Info
+            Constraint::Length(8),
+            Constraint::Length(5),
+            Constraint::Min(0),
         ])
         .split(area);
 
-    // Scanner config
     let is_editing = state.input_mode == InputMode::Editing
         && state.active_tab == AppTab::Scanner;
 
-    let fields = [
+    let fields: [(&str, &str, usize); 2] = [
         ("Hosts File  ", &state.input_hosts_file, 0),
         ("Concurrency ", &state.input_concurrency, 1),
     ];
@@ -440,9 +440,19 @@ fn render_scanner(f: &mut Frame, state: &AppState, area: Rect) {
     for (label, value, idx) in &fields {
         let is_active = state.active_field == *idx;
         let (prefix, value_style) = if is_active && is_editing {
-            ("▶ ", Style::default().fg(COLOR_HIGHLIGHT).add_modifier(Modifier::BOLD))
+            (
+                "▶ ",
+                Style::default()
+                    .fg(COLOR_HIGHLIGHT)
+                    .add_modifier(Modifier::BOLD),
+            )
         } else if is_active {
-            ("▶ ", Style::default().fg(COLOR_PRIMARY).add_modifier(Modifier::BOLD))
+            (
+                "▶ ",
+                Style::default()
+                    .fg(COLOR_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            )
         } else {
             ("  ", Style::default().fg(Color::White))
         };
@@ -454,7 +464,10 @@ fn render_scanner(f: &mut Frame, state: &AppState, area: Rect) {
         };
 
         lines.push(Line::from(vec![
-            Span::styled(format!("  {}: ", label), Style::default().fg(COLOR_DIM)),
+            Span::styled(
+                format!("  {}: ", label),
+                Style::default().fg(COLOR_DIM),
+            ),
             Span::styled(display, value_style),
         ]));
     }
@@ -467,12 +480,15 @@ fn render_scanner(f: &mut Frame, state: &AppState, area: Rect) {
     ]));
 
     let border_color = if is_editing { COLOR_PRIMARY } else { COLOR_BORDER };
+
     let config_block = Paragraph::new(Text::from(lines))
         .block(
             Block::default()
                 .title(Span::styled(
                     " ◈ Scanner Configuration ",
-                    Style::default().fg(COLOR_PRIMARY).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(COLOR_PRIMARY)
+                        .add_modifier(Modifier::BOLD),
                 ))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -481,33 +497,37 @@ fn render_scanner(f: &mut Frame, state: &AppState, area: Rect) {
 
     f.render_widget(config_block, chunks[0]);
 
-    // Progress
+    // Progress gauge
     let (scan_label, gauge_color) = match &state.scan_status {
-        ScanStatus::Idle => ("Idle - Press [S] to start", COLOR_DIM),
+        ScanStatus::Idle => ("Idle — Press [S] to start", COLOR_DIM),
         ScanStatus::Running => ("Scanning...", COLOR_PRIMARY),
         ScanStatus::Completed => ("Scan Complete!", COLOR_SUCCESS),
-        ScanStatus::Error(e) => ("Error", COLOR_ERROR),
-    };
-
-    let error_text = if let ScanStatus::Error(e) = &state.scan_status {
-        e.clone()
-    } else {
-        String::new()
+        ScanStatus::Error(_) => ("Error", COLOR_ERROR),
     };
 
     let progress_ratio = state.scan_progress.clamp(0.0, 1.0);
+
     let gauge = Gauge::default()
         .block(
             Block::default()
                 .title(Span::styled(
-                    format!(" ◈ Progress [{}/{}] ", state.scan_done, state.scan_total),
-                    Style::default().fg(COLOR_PRIMARY).add_modifier(Modifier::BOLD),
+                    format!(
+                        " ◈ Progress [{}/{}] ",
+                        state.scan_done, state.scan_total
+                    ),
+                    Style::default()
+                        .fg(COLOR_PRIMARY)
+                        .add_modifier(Modifier::BOLD),
                 ))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(COLOR_BORDER)),
         )
-        .gauge_style(Style::default().fg(gauge_color).bg(Color::DarkGray))
+        .gauge_style(
+            Style::default()
+                .fg(gauge_color)
+                .bg(Color::DarkGray),
+        )
         .ratio(progress_ratio)
         .label(format!(
             "{} ({:.0}%)",
@@ -521,7 +541,13 @@ fn render_scanner(f: &mut Frame, state: &AppState, area: Rect) {
     let working = state.scan_results.iter().filter(|r| r.is_working).count();
     let total = state.scan_results.len();
 
-    let info_lines = vec![
+    let error_text = if let ScanStatus::Error(e) = &state.scan_status {
+        e.clone()
+    } else {
+        String::new()
+    };
+
+    let mut info_lines = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled("  Results so far: ", Style::default().fg(COLOR_DIM)),
@@ -533,7 +559,8 @@ fn render_scanner(f: &mut Frame, state: &AppState, area: Rect) {
         Line::from(vec![
             Span::styled("  Best latency:   ", Style::default().fg(COLOR_DIM)),
             Span::styled(
-                state.scan_results
+                state
+                    .scan_results
                     .iter()
                     .filter(|r| r.is_working)
                     .map(|r| r.latency_ms)
@@ -543,28 +570,27 @@ fn render_scanner(f: &mut Frame, state: &AppState, area: Rect) {
                 Style::default().fg(COLOR_WARNING),
             ),
         ]),
-        Line::from(vec![
-            Span::styled(
-                "  Press [3] to view results, [u] to use selected SNI",
-                Style::default().fg(COLOR_DIM),
-            ),
-        ]),
-        if !error_text.is_empty() {
-            Line::from(Span::styled(
-                format!("  Error: {}", error_text),
-                Style::default().fg(COLOR_ERROR),
-            ))
-        } else {
-            Line::from("")
-        },
+        Line::from(vec![Span::styled(
+            "  Press [3] to view results, [u] to use selected SNI",
+            Style::default().fg(COLOR_DIM),
+        )]),
     ];
+
+    if !error_text.is_empty() {
+        info_lines.push(Line::from(Span::styled(
+            format!("  Error: {}", error_text),
+            Style::default().fg(COLOR_ERROR),
+        )));
+    }
 
     let info = Paragraph::new(Text::from(info_lines))
         .block(
             Block::default()
                 .title(Span::styled(
                     " ◈ Scanner Info ",
-                    Style::default().fg(COLOR_PRIMARY).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(COLOR_PRIMARY)
+                        .add_modifier(Modifier::BOLD),
                 ))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -581,7 +607,6 @@ fn render_results(f: &mut Frame, state: &AppState, area: Rect) {
         .constraints([Constraint::Min(0), Constraint::Length(3)])
         .split(area);
 
-    // Table headers
     let header_cells = ["#", "Host", "Latency", "Status", "TLS", "HTTP"]
         .iter()
         .map(|h| {
@@ -591,12 +616,14 @@ fn render_results(f: &mut Frame, state: &AppState, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             )
         });
+
     let header = Row::new(header_cells)
         .style(Style::default().bg(Color::DarkGray))
         .height(1);
 
     let visible_start = state.result_scroll;
-    let rows = state
+
+    let rows: Vec<Row> = state
         .scan_results
         .iter()
         .enumerate()
@@ -633,7 +660,7 @@ fn render_results(f: &mut Frame, state: &AppState, area: Rect) {
             ])
             .style(row_style)
         })
-        .collect::<Vec<_>>();
+        .collect();
 
     let working_count = state.scan_results.iter().filter(|r| r.is_working).count();
     let title = format!(
@@ -658,7 +685,9 @@ fn render_results(f: &mut Frame, state: &AppState, area: Rect) {
         Block::default()
             .title(Span::styled(
                 title,
-                Style::default().fg(COLOR_PRIMARY).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(COLOR_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
             ))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -668,10 +697,12 @@ fn render_results(f: &mut Frame, state: &AppState, area: Rect) {
 
     f.render_widget(table, chunks[0]);
 
-    // Bottom bar
     let hint = Paragraph::new(Line::from(vec![
         Span::styled(" [↑↓/jk] Navigate  ", Style::default().fg(COLOR_DIM)),
-        Span::styled("[u] Use selected SNI  ", Style::default().fg(COLOR_PRIMARY)),
+        Span::styled(
+            "[u] Use selected SNI  ",
+            Style::default().fg(COLOR_PRIMARY),
+        ),
         Span::styled("[PgUp/PgDn] Page  ", Style::default().fg(COLOR_DIM)),
         Span::styled("[g/G] Top/Bottom", Style::default().fg(COLOR_DIM)),
     ]))
@@ -701,10 +732,10 @@ fn render_logs(f: &mut Frame, state: &AppState, area: Rect) {
         .take(visible_height)
         .map(|entry| {
             let (level_str, level_color) = match entry.level {
-                LogLevel::Info => ("[INFO]   ", COLOR_PRIMARY),
-                LogLevel::Success => ("[OK]     ", COLOR_SUCCESS),
-                LogLevel::Warning => ("[WARN]   ", COLOR_WARNING),
-                LogLevel::Error => ("[ERROR]  ", COLOR_ERROR),
+                LogLevel::Info => ("[INFO]  ", COLOR_PRIMARY),
+                LogLevel::Success => ("[OK]    ", COLOR_SUCCESS),
+                LogLevel::Warning => ("[WARN]  ", COLOR_WARNING),
+                LogLevel::Error => ("[ERROR] ", COLOR_ERROR),
             };
 
             ListItem::new(Line::from(vec![
@@ -712,35 +743,50 @@ fn render_logs(f: &mut Frame, state: &AppState, area: Rect) {
                     format!(" {} ", entry.timestamp),
                     Style::default().fg(COLOR_DIM),
                 ),
-                Span::styled(level_str, Style::default().fg(level_color)),
-                Span::styled(&entry.message, Style::default().fg(Color::White)),
+                Span::styled(
+                    level_str,
+                    Style::default().fg(level_color),
+                ),
+                Span::styled(
+                    &entry.message,
+                    Style::default().fg(Color::White),
+                ),
             ]))
         })
         .collect();
 
-    let auto_scroll_indicator = if state.auto_scroll_logs { "AUTO" } else { "MANUAL" };
-    let log_list = List::new(items)
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    format!(
-                        " ◈ Logs [{}/{}] [{}] ",
-                        state.log_scroll + 1,
-                        state.logs.len(),
-                        auto_scroll_indicator
-                    ),
-                    Style::default().fg(COLOR_PRIMARY).add_modifier(Modifier::BOLD),
-                ))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(COLOR_BORDER)),
-        );
+    let auto_scroll_indicator = if state.auto_scroll_logs {
+        "AUTO"
+    } else {
+        "MANUAL"
+    };
+
+    let log_list = List::new(items).block(
+        Block::default()
+            .title(Span::styled(
+                format!(
+                    " ◈ Logs [{}/{}] [{}] ",
+                    state.log_scroll + 1,
+                    state.logs.len(),
+                    auto_scroll_indicator
+                ),
+                Style::default()
+                    .fg(COLOR_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(COLOR_BORDER)),
+    );
 
     f.render_widget(log_list, chunks[0]);
 
     let hint = Paragraph::new(Line::from(vec![
         Span::styled(" [↑↓/jk] Scroll  ", Style::default().fg(COLOR_DIM)),
-        Span::styled("[a] Toggle auto-scroll  ", Style::default().fg(COLOR_PRIMARY)),
+        Span::styled(
+            "[a] Toggle auto-scroll  ",
+            Style::default().fg(COLOR_PRIMARY),
+        ),
         Span::styled("[g/G] Top/Bottom", Style::default().fg(COLOR_DIM)),
     ]))
     .block(
@@ -759,18 +805,18 @@ fn render_help(f: &mut Frame, area: Rect) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
-    let nav_keys = vec![
+    let nav_keys: Vec<(&str, &str)> = vec![
         ("1-5", "Switch to tab"),
-        ("Tab/BackTab", "Next/prev tab"),
+        ("Tab / BackTab", "Next/prev tab"),
         ("q / Ctrl+C", "Quit"),
         ("?", "Toggle help popup"),
         ("", ""),
-        ("Navigation", ""),
+        ("── Navigation", ""),
         ("↑↓ / j k", "Scroll up/down"),
-        ("PgUp/PgDn", "Page up/down"),
+        ("PgUp / PgDn", "Page up/down"),
         ("g / G", "Top / Bottom"),
         ("", ""),
-        ("Editing", ""),
+        ("── Editing", ""),
         ("e / i", "Enter edit mode"),
         ("Esc", "Exit edit mode"),
         ("Tab", "Next field"),
@@ -778,90 +824,70 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("Enter", "Confirm field"),
     ];
 
-    let action_keys = vec![
-        ("Proxy", ""),
+    let action_keys: Vec<(&str, &str)> = vec![
+        ("── Proxy", ""),
         ("s", "Start/Stop proxy"),
         ("", ""),
-        ("Scanner", ""),
+        ("── Scanner", ""),
         ("S", "Start scan"),
         ("x", "Stop scan"),
         ("u", "Use selected SNI"),
         ("", ""),
-        ("Logs", ""),
+        ("── Logs", ""),
         ("a", "Toggle auto-scroll"),
         ("", ""),
-        ("Dashboard", ""),
+        ("── Dashboard", ""),
         ("n / p", "Next/prev field"),
     ];
 
-    let nav_items: Vec<ListItem> = nav_keys
-        .iter()
-        .map(|(key, desc)| {
-            if desc.is_empty() && !key.is_empty() {
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("  ── {} ", key),
+    let make_items = |keys: Vec<(&str, &str)>| -> Vec<ListItem<'static>> {
+        keys.into_iter()
+            .map(|(key, desc)| {
+                if key.is_empty() {
+                    ListItem::new(Line::from(""))
+                } else if desc.is_empty() {
+                    ListItem::new(Line::from(vec![Span::styled(
+                        format!("  {} ", key),
                         Style::default()
                             .fg(COLOR_DIM)
                             .add_modifier(Modifier::BOLD),
-                    ),
-                ]))
-            } else if key.is_empty() {
-                ListItem::new(Line::from(""))
-            } else {
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("  {:15}", key),
-                        Style::default().fg(COLOR_PRIMARY),
-                    ),
-                    Span::styled(*desc, Style::default().fg(Color::White)),
-                ]))
-            }
-        })
-        .collect();
+                    )]))
+                } else {
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!("  {:15}", key),
+                            Style::default().fg(COLOR_PRIMARY),
+                        ),
+                        Span::styled(
+                            desc.to_string(),
+                            Style::default().fg(Color::White),
+                        ),
+                    ]))
+                }
+            })
+            .collect()
+    };
 
-    let action_items: Vec<ListItem> = action_keys
-        .iter()
-        .map(|(key, desc)| {
-            if desc.is_empty() && !key.is_empty() {
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("  ── {} ", key),
-                        Style::default()
-                            .fg(COLOR_DIM)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]))
-            } else if key.is_empty() {
-                ListItem::new(Line::from(""))
-            } else {
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("  {:15}", key),
-                        Style::default().fg(COLOR_PRIMARY),
-                    ),
-                    Span::styled(*desc, Style::default().fg(Color::White)),
-                ]))
-            }
-        })
-        .collect();
-
-    let nav_list = List::new(nav_items).block(
+    let nav_list = List::new(make_items(nav_keys)).block(
         Block::default()
             .title(Span::styled(
                 " ◈ Navigation Keys ",
-                Style::default().fg(COLOR_PRIMARY).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(COLOR_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
             ))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(COLOR_BORDER)),
     );
 
-    let action_list = List::new(action_items).block(
+    let action_list = List::new(make_items(action_keys)).block(
         Block::default()
             .title(Span::styled(
                 " ◈ Action Keys ",
-                Style::default().fg(COLOR_PRIMARY).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(COLOR_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
             ))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -879,79 +905,110 @@ fn render_help_popup(f: &mut Frame, area: Rect) {
 
     let help_text = vec![
         Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                "  SNI Bypass RS-TUI - Quick Help",
-                Style::default()
-                    .fg(COLOR_PRIMARY)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
+        Line::from(vec![Span::styled(
+            "  SNI Bypass RS-TUI — Quick Help",
+            Style::default()
+                .fg(COLOR_PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        )]),
         Line::from(""),
-        Line::from(vec![Span::styled("  ── Setup ──", Style::default().fg(COLOR_DIM))]),
+        Line::from(vec![Span::styled(
+            "  ── Setup ──",
+            Style::default().fg(COLOR_DIM),
+        )]),
         Line::from(vec![
             Span::styled("  1. ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled("Go to Dashboard [1]", Style::default().fg(Color::White)),
+            Span::styled(
+                "Go to Dashboard [1]",
+                Style::default().fg(Color::White),
+            ),
         ]),
         Line::from(vec![
             Span::styled("  2. ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled("Edit target host [e]", Style::default().fg(Color::White)),
+            Span::styled(
+                "Edit target host [e]",
+                Style::default().fg(Color::White),
+            ),
         ]),
         Line::from(vec![
             Span::styled("  3. ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled("Set SNI (or leave same as target)", Style::default().fg(Color::White)),
+            Span::styled(
+                "Set SNI (or leave same as target)",
+                Style::default().fg(Color::White),
+            ),
         ]),
         Line::from(vec![
             Span::styled("  4. ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled("Press [s] to start proxy", Style::default().fg(Color::White)),
+            Span::styled(
+                "Press [s] to start proxy",
+                Style::default().fg(Color::White),
+            ),
         ]),
         Line::from(vec![
             Span::styled("  5. ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled("Set your device proxy to 127.0.0.1:<port>", Style::default().fg(Color::White)),
+            Span::styled(
+                "Set device proxy to 127.0.0.1:<port>",
+                Style::default().fg(Color::White),
+            ),
         ]),
         Line::from(""),
-        Line::from(vec![Span::styled("  ── SNI Scanner ──", Style::default().fg(COLOR_DIM))]),
+        Line::from(vec![Span::styled(
+            "  ── SNI Scanner ──",
+            Style::default().fg(COLOR_DIM),
+        )]),
         Line::from(vec![
             Span::styled("  1. ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled("Go to Scanner tab [2]", Style::default().fg(Color::White)),
+            Span::styled(
+                "Go to Scanner tab [2]",
+                Style::default().fg(Color::White),
+            ),
         ]),
         Line::from(vec![
             Span::styled("  2. ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled("Set hosts file path [e]", Style::default().fg(Color::White)),
+            Span::styled(
+                "Set hosts file path [e]",
+                Style::default().fg(Color::White),
+            ),
         ]),
         Line::from(vec![
             Span::styled("  3. ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled("Press [S] to start scan", Style::default().fg(Color::White)),
+            Span::styled(
+                "Press [S] to start scan",
+                Style::default().fg(Color::White),
+            ),
         ]),
         Line::from(vec![
             Span::styled("  4. ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled("View results in Results tab [3]", Style::default().fg(Color::White)),
+            Span::styled(
+                "View results in Results tab [3]",
+                Style::default().fg(Color::White),
+            ),
         ]),
         Line::from(vec![
             Span::styled("  5. ", Style::default().fg(COLOR_PRIMARY)),
-            Span::styled("Press [u] to use selected SNI", Style::default().fg(Color::White)),
-        ]),
-        Line::from(""),
-        Line::from(vec![Span::styled("  ── Termux ──", Style::default().fg(COLOR_DIM))]),
-        Line::from(vec![
             Span::styled(
-                "  pkg install rust",
-                Style::default().fg(COLOR_WARNING),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  cargo build --release",
-                Style::default().fg(COLOR_WARNING),
+                "Press [u] to use selected SNI",
+                Style::default().fg(Color::White),
             ),
         ]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                "  Press [?] or [Esc] to close",
-                Style::default().fg(COLOR_DIM),
-            ),
-        ]),
+        Line::from(vec![Span::styled(
+            "  ── Termux ──",
+            Style::default().fg(COLOR_DIM),
+        )]),
+        Line::from(vec![Span::styled(
+            "  pkg install rust",
+            Style::default().fg(COLOR_WARNING),
+        )]),
+        Line::from(vec![Span::styled(
+            "  cargo build --release",
+            Style::default().fg(COLOR_WARNING),
+        )]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Press [?] to close",
+            Style::default().fg(COLOR_DIM),
+        )]),
     ];
 
     let popup = Paragraph::new(Text::from(help_text))
@@ -959,7 +1016,9 @@ fn render_help_popup(f: &mut Frame, area: Rect) {
             Block::default()
                 .title(Span::styled(
                     " ◈ Help [?] ",
-                    Style::default().fg(COLOR_PRIMARY).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(COLOR_PRIMARY)
+                        .add_modifier(Modifier::BOLD),
                 ))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Double)
@@ -979,9 +1038,10 @@ fn render_statusbar(f: &mut Frame, state: &AppState, area: Rect) {
         InputMode::Normal => COLOR_PRIMARY,
         InputMode::Editing => COLOR_WARNING,
     };
-    let proxy_indicator = match state.proxy_status {
+
+    let proxy_indicator = match &state.proxy_status {
         ProxyStatus::Running => Span::styled(
-            " ▶ PROXY ON ",
+            " ▶ PROXY ON  ",
             Style::default().fg(COLOR_BG).bg(COLOR_SUCCESS),
         ),
         ProxyStatus::Error(_) => Span::styled(
@@ -993,6 +1053,7 @@ fn render_statusbar(f: &mut Frame, state: &AppState, area: Rect) {
             Style::default().fg(COLOR_BG).bg(COLOR_DIM),
         ),
     };
+
     let scan_indicator = match state.scan_status {
         ScanStatus::Running => Span::styled(
             " ⟳ SCANNING ",
@@ -1019,21 +1080,27 @@ fn render_statusbar(f: &mut Frame, state: &AppState, area: Rect) {
                 .bg(mode_color)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" ", Style::default()),
+        Span::raw(" "),
         proxy_indicator,
-        Span::styled(" ", Style::default()),
+        Span::raw(" "),
         scan_indicator,
-        Span::styled("  [q]uit  [?]help  [Tab]navigate", Style::default().fg(COLOR_DIM)),
+        Span::styled(
+            "  [q]uit  [?]help  [Tab]navigate",
+            Style::default().fg(COLOR_DIM),
+        ),
         termux_ind,
     ]);
 
-    let statusbar = Paragraph::new(status_line)
-        .style(Style::default().bg(COLOR_BG));
+    let statusbar =
+        Paragraph::new(status_line).style(Style::default().bg(COLOR_BG));
 
     f.render_widget(statusbar, area);
 }
 
-// Helper: centered popup
+// ─────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────
+
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -1058,6 +1125,7 @@ fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;
+
     if bytes >= GB {
         format!("{:.2} GB", bytes as f64 / GB as f64)
     } else if bytes >= MB {
